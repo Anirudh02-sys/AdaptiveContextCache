@@ -28,11 +28,18 @@ app = FastAPI()
 openai_cache: Optional[Cache] = None
 cache_dir = ""
 cache_file_key = ""
+server_mode = "contextcache"
 
 
 class CacheData(BaseModel):
     prompt: str
     answer: Optional[str] = ""
+
+
+def last_content_query_only(data, **kwargs):
+    """Return only the current query for GPTCache mode."""
+    content = last_content(data, **kwargs)
+    return content[0] if isinstance(content, tuple) else content
 
 
 @app.get("/")
@@ -102,7 +109,9 @@ async def chat(request: Request):
     auth_header = headers.get("authorization", None)
     openai_key = auth_header.split(" ")[1] if auth_header else ""
     cache_skip = openai_params.pop("cache_skip", False)
-    if cache_skip is False:
+    if server_mode == "no-cache":
+        cache_skip = True
+    elif cache_skip is False:
         messages = openai_params.get("messages")
         if "/cache_skip " in messages[0]["content"]:
             cache_skip = True
@@ -120,6 +129,7 @@ async def chat(request: Request):
                 for stream_response in openai.ChatCompletion.create(
                     cache_obj=openai_cache,
                     cache_skip=cache_skip,
+                    cache_mode=server_mode,
                     api_key=openai_key,
                     **openai_params,
                 ):
@@ -133,6 +143,7 @@ async def chat(request: Request):
             openai_response = openai.ChatCompletion.create(
                 cache_obj=openai_cache,
                 cache_skip=cache_skip,
+                cache_mode=server_mode,
                 api_key=openai_key,
                 **openai_params,
             )
@@ -169,10 +180,18 @@ def main():
         default=None,
         help="the cache config file of the openai completes proxy",
     )
+    parser.add_argument(
+        "-m",
+        "--server-mode",
+        choices=["no-cache", "gptcache", "contextcache"],
+        default="contextcache",
+        help="chat proxy cache mode: no-cache, gptcache, or contextcache",
+    )
 
     args = parser.parse_args()
     global cache_dir
     global cache_file_key
+    global server_mode
 
     if args.cache_config_file:
         init_conf = init_similar_cache_from_config(config_dir=args.cache_config_file)
@@ -181,6 +200,7 @@ def main():
         init_similar_cache(args.cache_dir)
         cache_dir = args.cache_dir
     cache_file_key = args.cache_file_key
+    server_mode = args.server_mode
 
     if args.openai:
         global openai_cache
@@ -191,9 +211,10 @@ def main():
                 cache_obj=openai_cache,
             )
         else:
+            pre_func = last_content_query_only if server_mode == "gptcache" else last_content
             init_similar_cache(
                 data_dir="openai_server_cache",
-                pre_func=last_content,
+                pre_func=pre_func,
                 cache_obj=openai_cache,
             )
 

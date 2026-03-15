@@ -128,6 +128,8 @@ def get(prompt: str, **kwargs) -> Any:
         prompt=prompt,
         **kwargs,
     )
+    if isinstance(res, tuple):
+        return res[0]
     return res
 
 

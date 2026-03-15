@@ -50,10 +50,15 @@ class Config:
             disable_report: bool = False,
             method: str = "mean", # or "attention",
             model_name: str = "qwq",
+            cache_mode: str = "context",  # context | plain | none
     ):
         if similarity_threshold < 0 or similarity_threshold > 1:
             raise CacheError(
                 "Invalid the similarity threshold param, reasonable range: 0-1"
+            )
+        if cache_mode not in ("context", "plain", "none"):
+            raise CacheError(
+                "Invalid cache_mode, expected one of: context, plain, none"
             )
         self.log_time_func = log_time_func
         self.similarity_threshold = similarity_threshold
@@ -73,6 +78,7 @@ class Config:
         self.dialuoge_threshold = dialuoge_threshold
         self.method = method
         self.model_name = model_name
+        self.cache_mode = cache_mode
         self.context_emb = None
         self.cur_id = 0
         self.set_use_api = False

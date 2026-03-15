@@ -255,6 +255,9 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                     question = pre_store_data
                 else:
                     question.content = pre_store_data
+                context_for_save = (
+                    np.array([embedding_data]) if embedding_data is not None else np.array([])
+                )
                 time_cal(
                     chat_cache.data_manager.save,
                     func_name="save",
@@ -263,6 +266,9 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                     question,
                     handled_llm_data,
                     embedding_data,
+                    context_for_save,
+                    chat_cache.config.cur_id,
+                    -1,
                     extra_param=context.get("save_func", None),
                     session=session,
                 )
@@ -278,6 +284,7 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
             )
         except Exception as e:  # pylint: disable=W0703
             gptcache_log.warning("failed to save the data to cache, error: %s", e)
+    chat_cache.config.cur_id = chat_cache.config.cur_id + 1
     return llm_data
 
 
@@ -501,6 +508,9 @@ async def aadapt(
                     question = pre_store_data
                 else:
                     question.content = pre_store_data
+                context_for_save = (
+                    np.array([embedding_data]) if embedding_data is not None else np.array([])
+                )
                 time_cal(
                     chat_cache.data_manager.save,
                     func_name="save",
@@ -509,6 +519,9 @@ async def aadapt(
                     question,
                     handled_llm_data,
                     embedding_data,
+                    context_for_save,
+                    chat_cache.config.cur_id,
+                    -1,
                     extra_param=context.get("save_func", None),
                     session=session,
                 )
@@ -523,6 +536,7 @@ async def aadapt(
             )
         except Exception:  # pylint: disable=W0703
             gptcache_log.error("failed to save the data to cache", exc_info=True)
+    chat_cache.config.cur_id = chat_cache.config.cur_id + 1
     return llm_data
 
 

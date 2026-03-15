@@ -31,6 +31,11 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
     cache_enable = chat_cache.cache_enable_func(*args, **kwargs)
     context = kwargs.pop("cache_context", {})
     embedding_data = None
+    retrival_id_query = {}
+    retrival_id_context = {}
+    cur_id = chat_cache.config.cur_id
+    pre_id = -1
+    cur_context_data = None
 
     # you want to retry to send the request to chatgpt when the cache is negative
     if 0 < temperature < 2:
@@ -50,8 +55,8 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
         cache_skip = kwargs.pop("cache_skip", False)
     cache_factor = kwargs.pop("cache_factor", 1.0)
 
-    # get current query and context from kwargs
-    pre_embedding_res, context_res = time_cal(
+    # get current query and optional context from kwargs
+    pre_process_res = time_cal(
         chat_cache.pre_embedding_func,
         func_name="pre_process",
         report_func=chat_cache.report.pre,
@@ -61,6 +66,11 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
         prompts=chat_cache.config.prompts,
         cache_config=chat_cache.config,
     )
+    if isinstance(pre_process_res, tuple) and len(pre_process_res) == 2:
+        pre_embedding_res, context_res = pre_process_res
+    else:
+        pre_embedding_res = pre_process_res
+        context_res = []
     if isinstance(pre_embedding_res, tuple):
         pre_store_data = pre_embedding_res[0]
         pre_embedding_data = pre_embedding_res[1]
@@ -99,7 +109,6 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
         if search_data_list is None:
             search_data_list = []
 
-        cur_id = chat_cache.config.cur_id
         cache_answers = []
         # get current context embedding
         if len(chat_cache.config.context_a) > 0:
@@ -127,9 +136,6 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
         method = chat_cache.config.method
         threshold = chat_cache.config.similarity_threshold
         dialuoge_threshold = chat_cache.config.dialuoge_threshold
-        retrival_id_query = {}
-        retrival_id_context = {}
-
         # exact_match
         if chat_cache.config.set_use_api == False:
             for search_data in search_data_list:
@@ -266,7 +272,10 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
         llm_data = time_cal(
             llm_handler, func_name="llm_request", report_func=chat_cache.report.llm
         )(*args, **kwargs)
-        llm_data = llm_data["choices"][0]["message"]["content"]
+        # Support both OpenAI-style responses and plain adapter payloads
+        # (e.g., API put/get helpers that pass through strings/None).
+        if isinstance(llm_data, dict) and "choices" in llm_data:
+            llm_data = llm_data["choices"][0]["message"]["content"]
         # print(llm_data)
 
     if cache_enable:
@@ -276,6 +285,13 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                     question = pre_store_data
                 else:
                     question.content = pre_store_data
+                context_for_save = cur_context_data
+                if context_for_save is None:
+                    context_for_save = (
+                        np.array([embedding_data])
+                        if embedding_data is not None
+                        else np.array([])
+                    )
                 time_cal(
                     chat_cache.data_manager.save,
                     func_name="save",
@@ -284,7 +300,7 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                     question,
                     handled_llm_data,
                     embedding_data,
-                    cur_context_data,
+                    context_for_save,
                     cur_id,
                     pre_id,
                     extra_param=context.get("save_func", None),
@@ -350,7 +366,7 @@ async def aadapt(
     else:  # temperature <= 0
         cache_skip = kwargs.pop("cache_skip", False)
     cache_factor = kwargs.pop("cache_factor", 1.0)
-    pre_embedding_res,context_res = time_cal(
+    pre_process_res = time_cal(
         chat_cache.pre_embedding_func,
         func_name="pre_process",
         report_func=chat_cache.report.pre,
@@ -360,6 +376,11 @@ async def aadapt(
         prompts=chat_cache.config.prompts,
         cache_config=chat_cache.config,
     )
+    if isinstance(pre_process_res, tuple) and len(pre_process_res) == 2:
+        pre_embedding_res, context_res = pre_process_res
+    else:
+        pre_embedding_res = pre_process_res
+        context_res = []
     if isinstance(pre_embedding_res, tuple):
         pre_store_data = pre_embedding_res[0]
         pre_embedding_data = pre_embedding_res[1]

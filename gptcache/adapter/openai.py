@@ -7,6 +7,7 @@ from typing import Any, AsyncGenerator, Iterator, List
 
 from gptcache import cache
 from gptcache.adapter.adapter import aadapt, adapt
+from gptcache.adapter.adapter_bac import adapt as adapt_bac
 from gptcache.adapter.base import BaseCacheLLM
 from gptcache.manager.scalar_data.base import Answer, DataType
 from gptcache.utils import import_openai, import_pillow
@@ -109,6 +110,7 @@ class ChatCompletion(openai.ChatCompletion, BaseCacheLLM):
     def create(cls, *args, **kwargs):
         chat_cache = kwargs.get("cache_obj", cache)
         enable_token_counter = chat_cache.config.enable_token_counter
+        cache_mode = kwargs.pop("cache_mode", "contextcache")
 
         def cache_data_convert(cache_data):
             if enable_token_counter:
@@ -122,6 +124,19 @@ class ChatCompletion(openai.ChatCompletion, BaseCacheLLM):
             return _construct_resp_from_cache(cache_data, saved_token)
 
         kwargs = cls.fill_base_args(**kwargs)
+        if cache_mode == "gptcache":
+            ans = adapt_bac(
+                cls._llm_handler,
+                cache_data_convert,
+                cls._update_cache_callback,
+                *args,
+                **kwargs,
+            )
+            return ans, False, {}, {}
+        if cache_mode == "no-cache":
+            kwargs["cache_skip"] = True
+        if cache_mode not in ("contextcache", "no-cache"):
+            raise ValueError(f"unsupported cache_mode: {cache_mode}")
         ans, is_hit, retrival_id_query, retrival_id_context = adapt(
             cls._llm_handler,
             cache_data_convert,
