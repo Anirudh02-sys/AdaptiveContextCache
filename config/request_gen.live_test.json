@@ -1,0 +1,102 @@
+{
+  "base_url": "http://127.0.0.1:8012",
+  "endpoint": "/v1/chat/completions",
+  "model": "gpt-3.5-turbo",
+  "api_key_env": "OPENAI_API_KEY",
+  "data_dir": "data/",
+  "file_glob": "application_*.jsonl",
+  "applications": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "dry_run": false,
+  "default_threads_per_app": 2,
+  "threads_per_application": {
+    "0": 3,
+    "1": 1,
+    "2": 2,
+    "3": 4,
+    "4": 2,
+    "5": 1,
+    "6": 3,
+    "7": 2,
+    "8": 1,
+    "9": 3
+  },
+  "default_delay_ms": 140,
+  "load_multiplier": 1.0,
+  "experiment_duration_seconds": 30,
+  "app_delay_ms": {
+    "0": 65,
+    "1": 210,
+    "2": 120,
+    "3": 55,
+    "4": 170,
+    "5": 240,
+    "6": 80,
+    "7": 140,
+    "8": 280,
+    "9": 95
+  },
+  "application_slo_expectations": {
+    "0": {
+      "latency_p99_ms": 900,
+      "accuracy_slo": 0.81
+    },
+    "1": {
+      "latency_p99_ms": 340,
+      "accuracy_slo": 0.955
+    },
+    "2": {
+      "latency_p99_ms": 560,
+      "accuracy_slo": 0.9
+    },
+    "3": {
+      "latency_p99_ms": 980,
+      "accuracy_slo": 0.79
+    },
+    "4": {
+      "latency_p99_ms": 420,
+      "accuracy_slo": 0.94
+    },
+    "5": {
+      "latency_p99_ms": 290,
+      "accuracy_slo": 0.968
+    },
+    "6": {
+      "latency_p99_ms": 780,
+      "accuracy_slo": 0.85
+    },
+    "7": {
+      "latency_p99_ms": 500,
+      "accuracy_slo": 0.92
+    },
+    "8": {
+      "latency_p99_ms": 240,
+      "accuracy_slo": 0.978
+    },
+    "9": {
+      "latency_p99_ms": 700,
+      "accuracy_slo": 0.87
+    }
+  },
+  "thread_jitter_ms": 45,
+  "max_conversations_per_app": 1,
+  "max_turns_per_conversation": 4,
+  "accuracy_enabled": true,
+  "accuracy_slo_metric": "avg_sequence_ratio",
+  "retry_count": 1,
+  "retry_backoff_ms": 150,
+  "timeout_seconds": 20,
+  "max_workers": 32,
+  "output_metrics_path": "data/test_apps/request_metrics_live_test.json",
+  "output_request_log_path": "data/test_apps/request_log_live_test.jsonl"
+}

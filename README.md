@@ -410,9 +410,10 @@ Key output fields per conversation record:
 Use `scripts/generate_requests.py` to replay application data with multiple threads
 per application and different per-application request speeds.
 
-Config template:
+Configs:
 
 - `config/request_gen.example.json`
+- `config/request_gen.live_test.json`
 
 Generate synthetic test files for 10 apps:
 
@@ -420,11 +421,32 @@ Generate synthetic test files for 10 apps:
 python3 scripts/gen_test_app_data.py --num-apps 10 --out-dir data/test_apps
 ```
 
-Run multithreaded generator:
+Start cache proxy first (required for non-dry-run requests):
+
+```bash
+env -u APPIMAGE /usr/bin/python3 -m gptcache_server.server \
+  -s 127.0.0.1 -p 8012 \
+  -d /tmp/contextcache_data \
+  -o True
+```
+
+Quick smoke run (real HTTP requests, shorter duration):
+
+```bash
+python3 scripts/generate_requests.py --config config/request_gen.live_test.json
+```
+
+Experiment/template run (dry-run by default):
 
 ```bash
 python3 scripts/generate_requests.py --config config/request_gen.example.json
 ```
+
+Notes on run behavior:
+
+- workers randomly sample conversations from each app dataset (sampling with replacement),
+- when `experiment_duration_seconds > 0`, all apps/threads stop at the same global wall-clock end time,
+- if `experiment_duration_seconds` is omitted or `<= 0`, workers fall back to draw-count mode based on per-thread shard size.
 
 Config reference (`config/request_gen.example.json`):
 
@@ -436,6 +458,8 @@ Config reference (`config/request_gen.example.json`):
   - `default_threads_per_app`, `threads_per_application`, `max_workers`
 - **Rate/speed control**
   - `default_delay_ms`, `app_delay_ms`, `thread_jitter_ms`, `load_multiplier`
+- **Experiment window**
+  - `experiment_duration_seconds` (all workers stop together when duration expires)
 - **Replay limits**
   - `max_conversations_per_app`, `max_turns_per_conversation`
 - **Reliability**
@@ -468,6 +492,7 @@ Notes:
 
 - thread counts are controlled by `default_threads_per_app` and `threads_per_application`,
 - per-app pacing is controlled by `default_delay_ms` and `app_delay_ms`,
+- app conversation selection is random with replacement per worker,
 - each turn includes prior turns from the same conversation only (history resets on next conversation),
 - metrics and optional per-request logs are written to configured output paths,
 - metrics include latency percentiles, cache hits/misses (when returned by proxy), and response-accuracy scores against expected dataset answers (`exact_match_rate`, `avg_token_f1`, `avg_sequence_ratio`),

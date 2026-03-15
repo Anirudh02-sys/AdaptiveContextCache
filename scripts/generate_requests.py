@@ -1,0 +1,671 @@
+#!/usr/bin/env python3
+"""
+Multithreaded request generator for application-grouped conversation files.
+
+Reads `application_*.jsonl`, spawns multiple threads per application, and sends
+requests to `/v1/chat/completions` while preserving history only within each
+conversation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import glob
+import json
+import os
+import random
+import re
+import threading
+import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from statistics import median
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import requests
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run multithreaded application-aware request generation."
+    )
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="Path to request generator JSON config.",
+    )
+    return parser.parse_args()
+
+
+def _load_json(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _write_json(path: str, payload: Dict[str, Any]) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _load_app_records(config: Dict[str, Any]) -> Dict[int, List[Dict[str, Any]]]:
+    data_dir = config["data_dir"]
+    file_glob = config.get("file_glob", "application_*.jsonl")
+    applications = set(config.get("applications", []))
+    paths = sorted(glob.glob(os.path.join(data_dir, file_glob)))
+    app_records: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+
+    for path in paths:
+        fname = os.path.basename(path)
+        app_id = None
+        if fname.startswith("application_") and fname.endswith(".jsonl"):
+            try:
+                app_id = int(fname[len("application_") : -len(".jsonl")])
+            except ValueError:
+                app_id = None
+        if app_id is None:
+            continue
+        if applications and app_id not in applications:
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                app_records[app_id].append(json.loads(line))
+    return app_records
+
+
+def _pairs_from_record(record: Dict[str, Any]) -> List[Tuple[str, str]]:
+    if isinstance(record.get("turn_pairs"), list) and record["turn_pairs"]:
+        pairs = []
+        for p in record["turn_pairs"]:
+            if not isinstance(p, dict):
+                continue
+            user = p.get("user", "")
+            assistant = p.get("assistant", "")
+            if isinstance(user, str) and user.strip():
+                pairs.append((user.strip(), assistant.strip() if isinstance(assistant, str) else ""))
+        if pairs:
+            return pairs
+
+    turns = record.get("turns", [])
+    if not isinstance(turns, list):
+        return []
+    pairs = []
+    pending_user: Optional[str] = None
+    for t in turns:
+        if not isinstance(t, dict):
+            continue
+        role = str(t.get("role", "")).strip().lower()
+        text = t.get("text", "")
+        if not isinstance(text, str):
+            continue
+        text = text.strip()
+        if not text:
+            continue
+        if role == "user":
+            pending_user = text
+        elif role == "assistant" and pending_user is not None:
+            pairs.append((pending_user, text))
+            pending_user = None
+    return pairs
+
+
+def _extract_response_text(resp_json: Any) -> str:
+    if isinstance(resp_json, dict):
+        choices = resp_json.get("choices")
+        if isinstance(choices, list) and choices:
+            c0 = choices[0]
+            if isinstance(c0, dict):
+                message = c0.get("message", {})
+                if isinstance(message, dict):
+                    content = message.get("content", "")
+                    if isinstance(content, str):
+                        return content
+                    return str(content)
+    if isinstance(resp_json, list) and resp_json:
+        return _extract_response_text(resp_json[0])
+    if isinstance(resp_json, str):
+        return resp_json
+    return str(resp_json)
+
+
+def _extract_response_details(resp_json: Any) -> Tuple[str, Optional[bool]]:
+    # Expected branch shape on this repo can be:
+    # [answer_payload, is_hit, query_flags, context_flags]
+    if isinstance(resp_json, list) and resp_json:
+        text = _extract_response_text(resp_json)
+        is_hit: Optional[bool] = None
+        if len(resp_json) > 1 and isinstance(resp_json[1], bool):
+            is_hit = resp_json[1]
+        return text, is_hit
+
+    if isinstance(resp_json, dict):
+        text = _extract_response_text(resp_json)
+        is_hit = resp_json.get("is_hit")
+        if isinstance(is_hit, bool):
+            return text, is_hit
+        return text, None
+
+    return _extract_response_text(resp_json), None
+
+
+def _normalize_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def _token_f1(pred: str, gold: str) -> float:
+    p_tokens = _normalize_text(pred).split()
+    g_tokens = _normalize_text(gold).split()
+    if not p_tokens or not g_tokens:
+        return 0.0
+    p_counts: Dict[str, int] = defaultdict(int)
+    g_counts: Dict[str, int] = defaultdict(int)
+    for t in p_tokens:
+        p_counts[t] += 1
+    for t in g_tokens:
+        g_counts[t] += 1
+    overlap = 0
+    for t, c in p_counts.items():
+        overlap += min(c, g_counts.get(t, 0))
+    if overlap == 0:
+        return 0.0
+    precision = overlap / len(p_tokens)
+    recall = overlap / len(g_tokens)
+    return (2 * precision * recall) / (precision + recall)
+
+
+def _accuracy_metrics(predicted: str, expected: str) -> Dict[str, float]:
+    p = predicted or ""
+    e = expected or ""
+    exact = 1.0 if _normalize_text(p) == _normalize_text(e) and _normalize_text(e) else 0.0
+    token_f1 = _token_f1(p, e)
+    ratio = difflib.SequenceMatcher(a=_normalize_text(p), b=_normalize_text(e)).ratio()
+    return {
+        "exact_match": exact,
+        "token_f1": float(token_f1),
+        "sequence_ratio": float(ratio),
+    }
+
+
+def _percentile(values: Sequence[float], p: float) -> float:
+    if not values:
+        return 0.0
+    sorted_vals = sorted(values)
+    if len(sorted_vals) == 1:
+        return float(sorted_vals[0])
+    idx = int(round((p / 100.0) * (len(sorted_vals) - 1)))
+    idx = max(0, min(idx, len(sorted_vals) - 1))
+    return float(sorted_vals[idx])
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+class RunState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.started_at = time.time()
+        self.request_count = 0
+        self.success_count = 0
+        self.error_count = 0
+        self.cache_hit_count = 0
+        self.cache_miss_count = 0
+        self.latencies_ms: List[float] = []
+        self.served_latencies_ms: List[float] = []
+        self.accuracy_count = 0
+        self.exact_match_count = 0
+        self.accuracy_token_f1_sum = 0.0
+        self.accuracy_sequence_ratio_sum = 0.0
+        self.per_app: Dict[int, Dict[str, Any]] = defaultdict(
+            lambda: {
+                "requests": 0,
+                "success": 0,
+                "errors": 0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "latencies_ms": [],
+                "served_latencies_ms": [],
+                "accuracy_count": 0,
+                "exact_match_count": 0,
+                "accuracy_token_f1_sum": 0.0,
+                "accuracy_sequence_ratio_sum": 0.0,
+            }
+        )
+
+    def add_result(
+        self,
+        app_id: int,
+        ok: bool,
+        latency_ms: float,
+        is_cache_hit: Optional[bool] = None,
+        accuracy: Optional[Dict[str, float]] = None,
+    ) -> None:
+        with self.lock:
+            self.request_count += 1
+            self.per_app[app_id]["requests"] += 1
+            if ok:
+                self.success_count += 1
+                self.per_app[app_id]["success"] += 1
+                self.served_latencies_ms.append(latency_ms)
+                self.per_app[app_id]["served_latencies_ms"].append(latency_ms)
+            else:
+                self.error_count += 1
+                self.per_app[app_id]["errors"] += 1
+            self.latencies_ms.append(latency_ms)
+            self.per_app[app_id]["latencies_ms"].append(latency_ms)
+            if is_cache_hit is True:
+                self.cache_hit_count += 1
+                self.per_app[app_id]["cache_hits"] += 1
+            elif is_cache_hit is False:
+                self.cache_miss_count += 1
+                self.per_app[app_id]["cache_misses"] += 1
+            if accuracy:
+                self.accuracy_count += 1
+                self.per_app[app_id]["accuracy_count"] += 1
+                self.accuracy_token_f1_sum += float(accuracy["token_f1"])
+                self.accuracy_sequence_ratio_sum += float(accuracy["sequence_ratio"])
+                self.per_app[app_id]["accuracy_token_f1_sum"] += float(accuracy["token_f1"])
+                self.per_app[app_id]["accuracy_sequence_ratio_sum"] += float(accuracy["sequence_ratio"])
+                if float(accuracy["exact_match"]) >= 1.0:
+                    self.exact_match_count += 1
+                    self.per_app[app_id]["exact_match_count"] += 1
+
+
+def _request_once(
+    session: requests.Session,
+    base_url: str,
+    endpoint: str,
+    headers: Dict[str, str],
+    payload: Dict[str, Any],
+    timeout_s: float,
+    dry_run: bool,
+) -> Tuple[bool, str, float, int, Optional[bool]]:
+    start = time.time()
+    if dry_run:
+        time.sleep(0.01)
+        latency_ms = (time.time() - start) * 1000.0
+        return True, "dry-run-response", latency_ms, 200, None
+
+    url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+    resp = session.post(url, headers=headers, json=payload, timeout=timeout_s)
+    latency_ms = (time.time() - start) * 1000.0
+    if resp.status_code >= 400:
+        return False, resp.text[:500], latency_ms, resp.status_code, None
+    response_text, is_hit = _extract_response_details(resp.json())
+    return True, response_text, latency_ms, resp.status_code, is_hit
+
+
+def _thread_worker(
+    app_id: int,
+    thread_idx: int,
+    conversations: Sequence[Dict[str, Any]],
+    conversation_draw_count: int,
+    experiment_end_time: Optional[float],
+    config: Dict[str, Any],
+    state: RunState,
+    log_path: str,
+    log_lock: threading.Lock,
+) -> None:
+    load_multiplier = _safe_float(config.get("load_multiplier", 1.0), default=1.0)
+    if load_multiplier <= 0:
+        load_multiplier = 1.0
+    default_delay_ms = int(config.get("default_delay_ms", 150))
+    app_delay_ms = int(config.get("app_delay_ms", {}).get(str(app_id), default_delay_ms))
+    jitter_ms = int(config.get("thread_jitter_ms", 40))
+    retry_count = int(config.get("retry_count", 1))
+    retry_backoff_ms = int(config.get("retry_backoff_ms", 200))
+    timeout_s = float(config.get("timeout_seconds", 30))
+    dry_run = bool(config.get("dry_run", False))
+    endpoint = str(config.get("endpoint", "/v1/chat/completions"))
+    base_url = str(config.get("base_url", "http://127.0.0.1:8012"))
+    model = str(config.get("model", "gpt-3.5-turbo"))
+    max_turns = int(config.get("max_turns_per_conversation", 0))
+    accuracy_enabled = bool(config.get("accuracy_enabled", True))
+
+    api_key_env = str(config.get("api_key_env", "OPENAI_API_KEY"))
+    api_key = os.getenv(api_key_env, "")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    thread_rng = random.Random((app_id + 1) * 1000 + thread_idx)
+    session = requests.Session()
+
+    if not conversations:
+        return
+
+    draw_count = max(0, int(conversation_draw_count))
+    remaining_draws = draw_count
+    while True:
+        if experiment_end_time is not None:
+            if time.time() >= experiment_end_time:
+                break
+        else:
+            if remaining_draws <= 0:
+                break
+            remaining_draws -= 1
+
+        conversation = conversations[thread_rng.randrange(len(conversations))]
+        pairs = _pairs_from_record(conversation)
+        if max_turns > 0:
+            pairs = pairs[:max_turns]
+        if not pairs:
+            continue
+
+        history: List[str] = []
+        conversation_id = str(conversation.get("conversation_id", "unknown"))
+        for turn_idx, (user_prompt, expected_answer) in enumerate(pairs, start=1):
+            if experiment_end_time is not None and time.time() >= experiment_end_time:
+                break
+
+            content_list = list(history) + [user_prompt]
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": content_list,
+                    }
+                ],
+                "temperature": 0,
+            }
+
+            ok = False
+            response_text = ""
+            latency_ms = 0.0
+            status_code = 0
+            last_err = ""
+            is_cache_hit: Optional[bool] = None
+
+            for attempt in range(retry_count + 1):
+                try:
+                    ok, response_text, latency_ms, status_code, is_cache_hit = _request_once(
+                        session=session,
+                        base_url=base_url,
+                        endpoint=endpoint,
+                        headers=headers,
+                        payload=payload,
+                        timeout_s=timeout_s,
+                        dry_run=dry_run,
+                    )
+                    if ok:
+                        break
+                    last_err = response_text
+                except Exception as exc:
+                    last_err = str(exc)
+                    ok = False
+                    latency_ms = 0.0
+                    status_code = 0
+                if attempt < retry_count:
+                    backoff = (retry_backoff_ms / 1000.0) * (attempt + 1)
+                    time.sleep(backoff)
+
+            accuracy = None
+            if ok and accuracy_enabled and isinstance(expected_answer, str) and expected_answer.strip():
+                accuracy = _accuracy_metrics(response_text, expected_answer)
+
+            state.add_result(
+                app_id=app_id,
+                ok=ok,
+                latency_ms=latency_ms,
+                is_cache_hit=is_cache_hit,
+                accuracy=accuracy,
+            )
+            used_answer = response_text if ok else f"request_failed: {last_err}"
+
+            # Preserve context only within this conversation.
+            history.append(f"Previous user question: {user_prompt}")
+            history.append(f"Previous model response: {used_answer}")
+
+            if log_path:
+                entry = {
+                    "timestamp": time.time(),
+                    "application_id": app_id,
+                    "thread_id": thread_idx,
+                    "conversation_id": conversation_id,
+                    "turn_index": turn_idx,
+                    "ok": ok,
+                    "status_code": status_code,
+                    "latency_ms": round(latency_ms, 3),
+                    "cache_hit": is_cache_hit,
+                    "request_prompt": user_prompt,
+                    "expected_response": expected_answer[:240] if isinstance(expected_answer, str) else "",
+                    "response_snippet": used_answer[:240],
+                    "request_content_count": len(content_list),
+                }
+                if accuracy:
+                    entry["accuracy"] = {
+                        "exact_match": round(float(accuracy["exact_match"]), 6),
+                        "token_f1": round(float(accuracy["token_f1"]), 6),
+                        "sequence_ratio": round(float(accuracy["sequence_ratio"]), 6),
+                    }
+                with log_lock:
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+            # Global multiplier accelerates/decelerates pacing across all apps.
+            # Example: load_multiplier=2.0 -> roughly half sleep duration -> ~2x load.
+            raw_delay_s = (app_delay_ms + thread_rng.randint(0, max(0, jitter_ms))) / 1000.0
+            delay_s = raw_delay_s / load_multiplier
+            if experiment_end_time is not None:
+                remaining_s = experiment_end_time - time.time()
+                if remaining_s <= 0:
+                    break
+                time.sleep(min(delay_s, remaining_s))
+            else:
+                time.sleep(delay_s)
+
+
+def _split_for_threads(
+    conversations: Sequence[Dict[str, Any]],
+    thread_count: int,
+) -> List[List[Dict[str, Any]]]:
+    buckets: List[List[Dict[str, Any]]] = [[] for _ in range(max(1, thread_count))]
+    for idx, conv in enumerate(conversations):
+        buckets[idx % len(buckets)].append(conv)
+    return buckets
+
+
+def run(config: Dict[str, Any]) -> Dict[str, Any]:
+    app_records = _load_app_records(config)
+    if not app_records:
+        raise RuntimeError("No application data files matched config.")
+
+    max_conversations = int(config.get("max_conversations_per_app", 0))
+    default_threads = int(config.get("default_threads_per_app", 1))
+    thread_overrides = config.get("threads_per_application", {})
+    slo_expectations = config.get("application_slo_expectations", {})
+    accuracy_slo_metric = str(config.get("accuracy_slo_metric", "avg_sequence_ratio"))
+    if accuracy_slo_metric not in {"exact_match_rate", "avg_token_f1", "avg_sequence_ratio"}:
+        accuracy_slo_metric = "avg_sequence_ratio"
+    experiment_duration_s = _safe_float(config.get("experiment_duration_seconds", 0.0), default=0.0)
+    if experiment_duration_s < 0:
+        experiment_duration_s = 0.0
+
+    log_path = str(config.get("output_request_log_path", "")).strip()
+    if log_path:
+        log_parent = os.path.dirname(log_path)
+        if log_parent:
+            os.makedirs(log_parent, exist_ok=True)
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("")
+    log_lock = threading.Lock()
+
+    state = RunState()
+    experiment_end_time = (
+        state.started_at + experiment_duration_s if experiment_duration_s > 0 else None
+    )
+    futures = []
+    total_threads = 0
+    with ThreadPoolExecutor(max_workers=int(config.get("max_workers", 64))) as executor:
+        for app_id in sorted(app_records.keys()):
+            app_convs = app_records[app_id]
+            if max_conversations > 0:
+                app_convs = app_convs[:max_conversations]
+            thread_count = int(thread_overrides.get(str(app_id), default_threads))
+            thread_count = max(1, thread_count)
+            split = _split_for_threads(app_convs, thread_count)
+            for thread_idx, shard in enumerate(split):
+                conversation_draw_count = len(shard)
+                if conversation_draw_count <= 0:
+                    continue
+                total_threads += 1
+                futures.append(
+                    executor.submit(
+                        _thread_worker,
+                        app_id,
+                        thread_idx,
+                        app_convs,
+                        conversation_draw_count,
+                        experiment_end_time,
+                        config,
+                        state,
+                        log_path,
+                        log_lock,
+                    )
+                )
+        for fut in as_completed(futures):
+            fut.result()
+
+    elapsed_s = max(0.001, time.time() - state.started_at)
+    per_app_summary: Dict[str, Any] = {}
+    slo_eval_total = 0
+    slo_eval_passed = 0
+    slo_eval_failed = 0
+    for app_id, stats in sorted(state.per_app.items()):
+        lat = stats["latencies_ms"]
+        served_lat = stats["served_latencies_ms"]
+        app_acc_count = int(stats["accuracy_count"])
+        app_exact = int(stats["exact_match_count"])
+        app_token_f1_avg = (
+            float(stats["accuracy_token_f1_sum"]) / app_acc_count if app_acc_count else 0.0
+        )
+        app_seq_ratio_avg = (
+            float(stats["accuracy_sequence_ratio_sum"]) / app_acc_count if app_acc_count else 0.0
+        )
+        p99_latency_all = round(_percentile(lat, 99), 3)
+        served_p99_latency = round(_percentile(served_lat, 99), 3)
+        observed_latency_for_slo = served_p99_latency if served_lat else p99_latency_all
+        observed_accuracy_for_slo = {
+            "exact_match_rate": round((app_exact / app_acc_count) if app_acc_count else 0.0, 6),
+            "avg_token_f1": round(app_token_f1_avg, 6),
+            "avg_sequence_ratio": round(app_seq_ratio_avg, 6),
+        }[accuracy_slo_metric]
+
+        app_slo = slo_expectations.get(str(app_id), {})
+        target_latency = app_slo.get("latency_p99_ms")
+        target_accuracy = app_slo.get("accuracy_slo")
+        latency_slo_met = None
+        accuracy_slo_met = None
+        app_slo_attained = None
+        if target_latency is not None:
+            latency_slo_met = observed_latency_for_slo <= _safe_float(target_latency, default=float("inf"))
+        if target_accuracy is not None:
+            accuracy_slo_met = observed_accuracy_for_slo >= _safe_float(target_accuracy, default=0.0)
+        if latency_slo_met is not None and accuracy_slo_met is not None:
+            app_slo_attained = bool(latency_slo_met and accuracy_slo_met)
+            slo_eval_total += 1
+            if app_slo_attained:
+                slo_eval_passed += 1
+            else:
+                slo_eval_failed += 1
+
+        per_app_summary[str(app_id)] = {
+            "requests": stats["requests"],
+            "success": stats["success"],
+            "errors": stats["errors"],
+            "cache_hits": stats["cache_hits"],
+            "cache_misses": stats["cache_misses"],
+            "p50_latency_ms": round(_percentile(lat, 50), 3),
+            "p95_latency_ms": round(_percentile(lat, 95), 3),
+            "p99_latency_ms": p99_latency_all,
+            "served_p50_latency_ms": round(_percentile(served_lat, 50), 3),
+            "served_p95_latency_ms": round(_percentile(served_lat, 95), 3),
+            "served_p99_latency_ms": served_p99_latency,
+            "throughput_rps": round(stats["requests"] / elapsed_s, 3),
+            "accuracy_count": app_acc_count,
+            "exact_match_rate": round((app_exact / app_acc_count) if app_acc_count else 0.0, 6),
+            "avg_token_f1": round(app_token_f1_avg, 6),
+            "avg_sequence_ratio": round(app_seq_ratio_avg, 6),
+            "slo_target": {
+                "latency_p99_ms": target_latency,
+                "accuracy_slo": target_accuracy,
+                "accuracy_metric": accuracy_slo_metric,
+            },
+            "slo_observed": {
+                "latency_p99_ms": observed_latency_for_slo,
+                accuracy_slo_metric: observed_accuracy_for_slo,
+            },
+            "slo_attainment": {
+                "latency_slo_met": latency_slo_met,
+                "accuracy_slo_met": accuracy_slo_met,
+                "attained": app_slo_attained,
+            },
+        }
+
+    lat_all = state.latencies_ms
+    served_lat_all = state.served_latencies_ms
+    accuracy_count = state.accuracy_count
+    exact_match_rate = (state.exact_match_count / accuracy_count) if accuracy_count else 0.0
+    avg_token_f1 = (state.accuracy_token_f1_sum / accuracy_count) if accuracy_count else 0.0
+    avg_sequence_ratio = (
+        state.accuracy_sequence_ratio_sum / accuracy_count if accuracy_count else 0.0
+    )
+    result = {
+        "dry_run": bool(config.get("dry_run", False)),
+        "load_multiplier": _safe_float(config.get("load_multiplier", 1.0), default=1.0),
+        "experiment_duration_seconds": round(experiment_duration_s, 3),
+        "time_limited_run": bool(experiment_end_time is not None),
+        "threads_spawned": total_threads,
+        "applications_seen": sorted(list(app_records.keys())),
+        "requests_sent": state.request_count,
+        "success": state.success_count,
+        "errors": state.error_count,
+        "cache_hits": state.cache_hit_count,
+        "cache_misses": state.cache_miss_count,
+        "elapsed_seconds": round(elapsed_s, 3),
+        "overall_throughput_rps": round(state.request_count / elapsed_s, 3),
+        "overall_p50_latency_ms": round(_percentile(lat_all, 50), 3),
+        "overall_p95_latency_ms": round(_percentile(lat_all, 95), 3),
+        "overall_p99_latency_ms": round(_percentile(lat_all, 99), 3),
+        "overall_median_latency_ms": round(median(lat_all), 3) if lat_all else 0.0,
+        "served_p50_latency_ms": round(_percentile(served_lat_all, 50), 3),
+        "served_p95_latency_ms": round(_percentile(served_lat_all, 95), 3),
+        "served_p99_latency_ms": round(_percentile(served_lat_all, 99), 3),
+        "served_median_latency_ms": round(median(served_lat_all), 3) if served_lat_all else 0.0,
+        "accuracy_count": accuracy_count,
+        "exact_match_rate": round(exact_match_rate, 6),
+        "avg_token_f1": round(avg_token_f1, 6),
+        "avg_sequence_ratio": round(avg_sequence_ratio, 6),
+        "slo_summary": {
+            "accuracy_metric": accuracy_slo_metric,
+            "applications_with_targets": slo_eval_total,
+            "applications_attained": slo_eval_passed,
+            "applications_missed": slo_eval_failed,
+        },
+        "per_application": per_app_summary,
+    }
+    return result
+
+
+def main() -> None:
+    args = parse_args()
+    config = _load_json(args.config)
+    metrics = run(config)
+    metrics_path = str(config.get("output_metrics_path", "")).strip()
+    if metrics_path:
+        _write_json(metrics_path, metrics)
+    print(json.dumps(metrics, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
