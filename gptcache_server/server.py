@@ -29,6 +29,7 @@ openai_cache: Optional[Cache] = None
 cache_dir = ""
 cache_file_key = ""
 server_mode = "contextcache"
+dry_run: bool = False
 
 
 class CacheData(BaseModel):
@@ -131,6 +132,7 @@ async def chat(request: Request):
                     cache_skip=cache_skip,
                     cache_mode=server_mode,
                     api_key=openai_key,
+                    dry_run=dry_run,
                     **openai_params,
                 ):
                     if stream_response == "[DONE]":
@@ -145,6 +147,7 @@ async def chat(request: Request):
                 cache_skip=cache_skip,
                 cache_mode=server_mode,
                 api_key=openai_key,
+                dry_run=dry_run,
                 **openai_params,
             )
             return JSONResponse(content=openai_response)
@@ -187,11 +190,19 @@ def main():
         default="contextcache",
         help="chat proxy cache mode: no-cache, gptcache, or contextcache",
     )
+    parser.add_argument(
+        "-dr",
+        "--dry-run",
+        choices=["no", "yes"],
+        default="no",
+        help="whether to run in dry-run mode",
+    )
 
     args = parser.parse_args()
     global cache_dir
     global cache_file_key
     global server_mode
+    global dry_run
 
     if args.cache_config_file:
         init_conf = init_similar_cache_from_config(config_dir=args.cache_config_file)
@@ -201,6 +212,7 @@ def main():
         cache_dir = args.cache_dir
     cache_file_key = args.cache_file_key
     server_mode = args.server_mode
+    dry_run = args.dry_run == "yes"
 
     if args.openai:
         global openai_cache

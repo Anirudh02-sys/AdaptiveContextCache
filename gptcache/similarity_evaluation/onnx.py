@@ -56,6 +56,9 @@ class OnnxModelEvaluation(SimilarityEvaluation):
         self.model = model
         onnx_model_path = hf_hub_download(repo_id=model, filename="model.onnx")
         self.ort_session = onnxruntime.InferenceSession(onnx_model_path)
+        self.max_length = getattr(self.tokenizer, "model_max_length", 512) or 512
+        if self.max_length > 100000:
+            self.max_length = 512
 
     # WARNING: the model cannot evaluate text with more than 512 tokens
     def evaluation(
@@ -102,7 +105,11 @@ class OnnxModelEvaluation(SimilarityEvaluation):
         ]
         batch_encoding_list = [
             self.tokenizer.encode_plus(
-                text["text_a"], text["text_b"], padding="longest"
+                text["text_a"],
+                text["text_b"],
+                padding="longest",
+                truncation=True,
+                max_length=self.max_length,
             )
             for text in inference_texts
         ]

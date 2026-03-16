@@ -697,3 +697,11 @@ unset APPIMAGE
 
 This repository is based on GPTCache-style architecture (`setup.py` still references GPTCache metadata). Treat this branch as a customized ContextCache variant and validate behavior in your target deployment path.
 
+**Performance note:**  
+When using ContextCache, you'll notice a significant latency difference between cache **hits** and **misses**:  
+- **Cache hit:** ~0.2 seconds per response  
+- **Cache miss:** ~1.4 seconds per response  
+
+This is expected, as cache misses require a fresh model completion, while hits retrieve results instantly from the cache.
+
+

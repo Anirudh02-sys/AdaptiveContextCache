@@ -28,6 +28,21 @@ import_openai()
 # pylint: disable=E1102
 import openai
 
+# Configure OpenAI client defaults for contextcache:
+# - Prefer VOCAREUM_API_KEY / VOCAREUM_BASE_URL when present,
+#   otherwise fall back to standard OPENAI_API_KEY and default base.
+_env_voc_api_key = os.getenv("VOCAREUM_API_KEY")
+_env_openai_api_key = os.getenv("OPENAI_API_KEY")
+_env_voc_base_url = os.getenv("VOCAREUM_BASE_URL")
+
+if _env_voc_api_key or _env_openai_api_key:
+    openai.api_key = _env_voc_api_key or _env_openai_api_key
+
+if _env_voc_base_url:
+    # Older OpenAI SDKs use api_base; newer clients may use base_url at construction time.
+    # Here we set api_base so existing ChatCompletion/Completion calls route correctly.
+    openai.api_base = _env_voc_base_url
+
 
 class ChatCompletion(openai.ChatCompletion, BaseCacheLLM):
     """Openai ChatCompletion Wrapper
@@ -56,6 +71,21 @@ class ChatCompletion(openai.ChatCompletion, BaseCacheLLM):
 
     @classmethod
     def _llm_handler(cls, *llm_args, **llm_kwargs):
+        dry_run = bool(llm_kwargs.pop("dry_run", False))
+        if dry_run:
+            # Minimal OpenAI-style response without making a network call.
+            time.sleep(1.0)
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": f"[dry-run] no OpenAI call made.",
+                        }
+                    }
+                ]
+            }
+
         try:
             return (
                 super().create(*llm_args, **llm_kwargs)
@@ -67,6 +97,20 @@ class ChatCompletion(openai.ChatCompletion, BaseCacheLLM):
 
     @classmethod
     async def _allm_handler(cls, *llm_args, **llm_kwargs):
+        dry_run = bool(llm_kwargs.pop("dry_run", False))
+        if dry_run:
+            time.sleep(1.0)
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": f"[dry-run] no OpenAI call made.",
+                        }
+                    }
+                ]
+            }
+
         try:
             return (
                 (await super().acreate(*llm_args, **llm_kwargs))

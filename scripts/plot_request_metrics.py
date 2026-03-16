@@ -125,6 +125,9 @@ def _plot_slo_metric(
     metric_key: str,
     title_prefix: str,
     filename_suffix: str,
+    target_field: str,
+    observed_field: str,
+    higher_is_better: bool,
 ) -> str:
     rows = _sorted_per_app(metrics)
     app_ids = [app_id for app_id, _ in rows]
@@ -133,9 +136,25 @@ def _plot_slo_metric(
     missed = 0
     no_target = 0
     per_app_code: List[int] = []
+    margins: List[float] = []
     for _, stats in rows:
         slo = stats.get("slo_attainment", {})
+        slo_target = stats.get("slo_target", {}) or {}
+        slo_observed = stats.get("slo_observed", {}) or {}
         val = slo.get(metric_key) if isinstance(slo, dict) else None
+        target_val = slo_target.get(target_field)
+        observed_val = slo_observed.get(observed_field)
+
+        margin = 0.0
+        if target_val is not None and observed_val is not None:
+            try:
+                t = float(target_val)
+                o = float(observed_val)
+                margin = (o - t) if higher_is_better else (t - o)
+            except (TypeError, ValueError):
+                margin = 0.0
+        margins.append(margin)
+
         if val is True:
             attained += 1
             per_app_code.append(1)
@@ -158,19 +177,19 @@ def _plot_slo_metric(
     ax1.grid(axis="y", alpha=0.3)
 
     colors = []
-    for code in per_app_code:
-        if code == 1:
-            colors.append("#4caf50")
-        elif code == -1:
-            colors.append("#f44336")
-        else:
+    for code, margin in zip(per_app_code, margins):
+        if code == 0:
             colors.append("#9e9e9e")
-    y_vals = [1 if c == 1 else (0 if c == 0 else -1) for c in per_app_code]
-    ax2.bar(app_ids, y_vals, color=colors)
-    ax2.set_yticks([-1, 0, 1])
-    ax2.set_yticklabels(["Missed", "No Target", "Attained"])
+        elif margin >= 0:
+            colors.append("#4caf50")
+        else:
+            colors.append("#f44336")
+    ax2.axhline(0.0, color="#666666", linewidth=1, linestyle="--")
+    ax2.bar(app_ids, margins, color=colors)
+    ax2.set_yticks(ax2.get_yticks())
+    ax2.set_ylabel("Margin vs target\n(+ better, - worse)")
     ax2.set_xlabel("Application ID")
-    ax2.set_title(f"Per-Application {title_prefix} SLO Status")
+    ax2.set_title(f"Per-Application {title_prefix} SLO Margin")
     ax2.grid(axis="y", alpha=0.3)
 
     return _save(fig, output_dir, f"{prefix}_{filename_suffix}.png")
@@ -190,7 +209,11 @@ def main() -> None:
         metric_key="latency_slo_met",
         title_prefix="Latency",
         filename_suffix="latency_slo_attainment",
+        target_field="latency_p99_ms",
+        observed_field="latency_p99_ms",
+        higher_is_better=False,
     )
+    accuracy_metric_name = str(metrics.get("slo_summary", {}).get("accuracy_metric", "avg_sequence_ratio"))
     accuracy_slo_plot = _plot_slo_metric(
         metrics=metrics,
         output_dir=args.output_dir,
@@ -198,6 +221,9 @@ def main() -> None:
         metric_key="accuracy_slo_met",
         title_prefix="Accuracy",
         filename_suffix="accuracy_slo_attainment",
+        target_field="accuracy_slo",
+        observed_field=accuracy_metric_name,
+        higher_is_better=True,
     )
 
     print("Wrote plots:")
