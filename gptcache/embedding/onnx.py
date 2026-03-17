@@ -39,6 +39,7 @@ class Onnx(BaseEmbedding):
         )
         
         self.__dimension = config.hidden_size
+        self.input_names = [input.name for input in self.ort_session.get_inputs()]
 
     def to_embeddings(self, data, **_):
         """Generate embedding given text input.
@@ -48,13 +49,21 @@ class Onnx(BaseEmbedding):
 
         :return: a text embedding in shape of (dim,).
         """
-        encoded_text = self.tokenizer.encode_plus(data, padding="max_length")
+        encoded_text = self.tokenizer(
+            data,
+            padding="max_length",
+            truncation=True,
+            return_tensors="np",
+            max_length=512,
+        )
 
-        ort_inputs = {
-            "input_ids": np.array(encoded_text["input_ids"]).astype("int64").reshape(1, -1),
-            "attention_mask": np.array(encoded_text["attention_mask"]).astype("int64").reshape(1, -1),
-            "token_type_ids": np.array(encoded_text["token_type_ids"]).astype("int64").reshape(1, -1),
-        }
+        ort_inputs = {}
+        if "input_ids" in self.input_names:
+            ort_inputs["input_ids"] = encoded_text["input_ids"].astype("int64")
+        if "attention_mask" in self.input_names:
+            ort_inputs["attention_mask"] = encoded_text["attention_mask"].astype("int64")
+        if "token_type_ids" in self.input_names and "token_type_ids" in encoded_text:
+            ort_inputs["token_type_ids"] = encoded_text["token_type_ids"].astype("int64")
 
         ort_outputs = self.ort_session.run(None, ort_inputs)
         ort_feat = ort_outputs[0]

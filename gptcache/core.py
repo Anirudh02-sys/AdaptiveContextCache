@@ -81,7 +81,12 @@ class Cache:
         self.post_process_messages_func = post_func if post_func else post_process_messages_func
         self.config = config
         self.next_cache = next_cache
-        self.input_summarizer = SummarizationContextProcess()
+        # Only initialize the summarizer when input summarization is enabled.
+        # This avoids forcing transformer/pytorch summarization dependencies for
+        # normal cache server runs.
+        self.input_summarizer = None
+        if self.config.input_summary_len is not None:
+            self.input_summarizer = SummarizationContextProcess()
 
         @atexit.register
         def close():
@@ -115,6 +120,8 @@ class Cache:
                 cur += 1
                 newanswers.append(answers[i])
                 if len(question) > text_length:
+                    if self.input_summarizer is None:
+                        self.input_summarizer = SummarizationContextProcess()
                     question = self.input_summarizer.summarize_to_sentence([question], text_length)
                 emb = self.embedding_func(question)
                 newemb.append(emb)
