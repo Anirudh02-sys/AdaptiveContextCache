@@ -103,6 +103,7 @@ async def chat(request: Request):
 
     import_starlette()
     from starlette.responses import StreamingResponse, JSONResponse
+    from starlette.concurrency import run_in_threadpool
 
     openai_params = await request.json()
     is_stream = openai_params.get("stream", False)
@@ -142,7 +143,8 @@ async def chat(request: Request):
 
             return StreamingResponse(generate(), media_type="text/event-stream")
         else:
-            openai_response = openai.ChatCompletion.create(
+            openai_response = await run_in_threadpool(
+                openai.ChatCompletion.create,
                 cache_obj=openai_cache,
                 cache_skip=cache_skip,
                 cache_mode=server_mode,
@@ -224,8 +226,9 @@ def main():
             )
         else:
             pre_func = last_content_query_only if server_mode == "gptcache" else last_content
+            openai_cache_dir = os.path.join(args.cache_dir, "openai_server_cache")
             init_similar_cache(
-                data_dir="openai_server_cache",
+                data_dir=openai_cache_dir,
                 pre_func=pre_func,
                 cache_obj=openai_cache,
             )

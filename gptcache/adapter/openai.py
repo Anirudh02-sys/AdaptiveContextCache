@@ -7,7 +7,6 @@ from typing import Any, AsyncGenerator, Iterator, List
 
 from gptcache import cache
 from gptcache.adapter.adapter import aadapt, adapt
-from gptcache.adapter.adapter_bac import adapt as adapt_bac
 from gptcache.adapter.base import BaseCacheLLM
 from gptcache.manager.scalar_data.base import Answer, DataType
 from gptcache.utils import import_openai, import_pillow
@@ -34,6 +33,7 @@ import openai
 _env_voc_api_key = os.getenv("VOCAREUM_API_KEY")
 _env_openai_api_key = os.getenv("OPENAI_API_KEY")
 _env_voc_base_url = os.getenv("VOCAREUM_BASE_URL")
+_env_openai_base = os.getenv("OPENAI_API_BASE") or os.getenv("OPENAI_API_BASE_URL")
 
 if _env_voc_api_key or _env_openai_api_key:
     openai.api_key = _env_voc_api_key or _env_openai_api_key
@@ -42,6 +42,8 @@ if _env_voc_base_url:
     # Older OpenAI SDKs use api_base; newer clients may use base_url at construction time.
     # Here we set api_base so existing ChatCompletion/Completion calls route correctly.
     openai.api_base = _env_voc_base_url
+elif _env_openai_base:
+    openai.api_base = _env_openai_base
 
 
 class ChatCompletion(openai.ChatCompletion, BaseCacheLLM):
@@ -135,8 +137,21 @@ class ChatCompletion(openai.ChatCompletion, BaseCacheLLM):
 
             return hook_openai_data(llm_data)
         elif not isinstance(llm_data, Iterator):
+            cache_text = ""
+            if isinstance(llm_data, str):
+                cache_text = llm_data
+            else:
+                try:
+                    cache_text = get_message_from_openai_answer(llm_data)
+                except (TypeError, KeyError, IndexError):
+                    cache_text = ""
+                if not cache_text:
+                    try:
+                        cache_text = get_text_from_openai_answer(llm_data)
+                    except (TypeError, KeyError, IndexError):
+                        cache_text = ""
             update_cache_func(
-                Answer(llm_data, DataType.STR)
+                Answer(cache_text or str(llm_data), DataType.STR)
             )
             return llm_data
         else:
@@ -169,14 +184,16 @@ class ChatCompletion(openai.ChatCompletion, BaseCacheLLM):
 
         kwargs = cls.fill_base_args(**kwargs)
         if cache_mode == "gptcache":
-            ans = adapt_bac(
+            cache_context = kwargs.setdefault("cache_context", {})
+            cache_context["ignore_context"] = True
+            ans, is_hit, retrival_id_query, retrival_id_context = adapt(
                 cls._llm_handler,
                 cache_data_convert,
                 cls._update_cache_callback,
                 *args,
                 **kwargs,
             )
-            return ans, False, {}, {}
+            return ans, is_hit, retrival_id_query, retrival_id_context
         if cache_mode == "no-cache":
             kwargs["cache_skip"] = True
         if cache_mode not in ("contextcache", "no-cache"):

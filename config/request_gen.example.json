@@ -1,93 +1,102 @@
 {
   "base_url": "http://127.0.0.1:8012",
   "endpoint": "/v1/chat/completions",
-  "model": "gpt-3.5-turbo", 
-  "api_key_env": "OPENAI_API_KEY",
+  "model": "@azure-1/gpt-4o",
+  "api_key_env": "VOCAREUM_API_KEY",
   "data_dir": "data/",
   "file_glob": "application_*.jsonl",
   "applications": [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
   ],
   "dry_run": false,
-  "default_threads_per_app": 2,
+  "default_threads_per_app": 1,
   "threads_per_application": {
-    "0": 3,
+    "0": 2,
     "1": 1,
-    "2": 2,
-    "3": 4,
-    "4": 2,
+    "2": 1,
+    "3": 2,
+    "4": 1,
     "5": 1,
-    "6": 3,
-    "7": 2,
+    "6": 2,
+    "7": 1,
     "8": 1,
-    "9": 3
+    "9": 2
   },
-  "default_delay_ms": 140,
-  "load_multiplier": 1.0,
-  "experiment_duration_seconds": 10,
+  "default_delay_ms": 650,
+  "load_multiplier": 1,
+  "experiment_duration_seconds": 15,
   "app_delay_ms": {
-    "0": 65,
-    "1": 210,
-    "2": 120,
-    "3": 55,
-    "4": 170,
-    "5": 240,
-    "6": 80,
-    "7": 140,
-    "8": 280,
-    "9": 95
+    "0": 320,
+    "1": 900,
+    "2": 560,
+    "3": 280,
+    "4": 760,
+    "5": 1020,
+    "6": 400,
+    "7": 680,
+    "8": 1180,
+    "9": 460
   },
   "application_slo_expectations": {
     "0": {
-      "latency_p99_ms": 900,
-      "accuracy_slo": 0.81
+      "latency_p99_ms": 13000,
+      "accuracy_slo": 0.04
     },
     "1": {
-      "latency_p99_ms": 340,
-      "accuracy_slo": 0.955
+      "latency_p99_ms": 16000,
+      "accuracy_slo": 0.08
     },
     "2": {
-      "latency_p99_ms": 560,
-      "accuracy_slo": 0.9
+      "latency_p99_ms": 14000,
+      "accuracy_slo": 0.06
     },
     "3": {
-      "latency_p99_ms": 980,
-      "accuracy_slo": 0.79
+      "latency_p99_ms": 15000,
+      "accuracy_slo": 0.045
     },
     "4": {
-      "latency_p99_ms": 420,
-      "accuracy_slo": 0.94
+      "latency_p99_ms": 21000,
+      "accuracy_slo": 0.08
     },
     "5": {
-      "latency_p99_ms": 290,
-      "accuracy_slo": 0.968
+      "latency_p99_ms": 23000,
+      "accuracy_slo": 0.1
     },
     "6": {
-      "latency_p99_ms": 780,
-      "accuracy_slo": 0.85
+      "latency_p99_ms": 19000,
+      "accuracy_slo": 0.06
     },
     "7": {
-      "latency_p99_ms": 500,
-      "accuracy_slo": 0.005
+      "latency_p99_ms": 21000,
+      "accuracy_slo": 0.08
     },
     "8": {
-      "latency_p99_ms": 240,
-      "accuracy_slo": 0.978
+      "latency_p99_ms": 24000,
+      "accuracy_slo": 0.12
     },
     "9": {
-      "latency_p99_ms": 700,
-      "accuracy_slo": 0.03
+      "latency_p99_ms": 19000,
+      "accuracy_slo": 0.06
     }
   },
-  "thread_jitter_ms": 45,
-  "max_conversations_per_app": 20,
-  "max_turns_per_conversation": 10,
+  "thread_jitter_ms": 90,
+  "max_conversations_per_app": 12,
+  "max_turns_per_conversation": 4,
   "accuracy_enabled": true,
-  "accuracy_slo_metric": "avg_sequence_ratio",
-  "retry_count": 1,
-  "retry_backoff_ms": 150,
-  "timeout_seconds": 20,
-  "max_workers": 32,
+  "accuracy_slo_metric": "avg_token_f1",
+  "retry_count": 0,
+  "retry_backoff_ms": 0,
+  "timeout_seconds": 30,
+  "max_workers": 16,
   "output_metrics_path": "data/test_apps/request_metrics.json",
   "output_request_log_path": "data/test_apps/request_log.jsonl"
 }

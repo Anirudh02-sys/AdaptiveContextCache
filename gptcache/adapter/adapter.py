@@ -7,6 +7,29 @@ from gptcache.utils.error import NotInitError
 from gptcache.utils.log import gptcache_log
 from gptcache.utils.time import time_cal
 
+
+def _message_content_to_text(content):
+    """Normalize OpenAI message content to plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+                else:
+                    parts.append(str(item.get("content", item)))
+            else:
+                parts.append(str(item))
+        return "\n".join(part for part in parts if part)
+    if content is None:
+        return ""
+    return str(content)
+
+
 def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwargs):
     """Adapt to different llm
 
@@ -30,6 +53,7 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
         raise NotInitError()
     cache_enable = chat_cache.cache_enable_func(*args, **kwargs)
     context = kwargs.pop("cache_context", {})
+    ignore_context = bool(context.get("ignore_context", False))
     embedding_data = None
     retrival_id_query = {}
     retrival_id_context = {}
@@ -170,6 +194,18 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
 
                 if cur_question_sim > threshold:
                     retrival_id_query[cache_data.cur_id] = True
+                    if ignore_context:
+                        cache_answers.append(
+                            (
+                                float(cur_question_sim),
+                                cache_data.answers[0].answer,
+                                search_data,
+                                cache_data,
+                            )
+                        )
+                        retrival_id_context[cache_data.cur_id] = True
+                        chat_cache.data_manager.hit_cache_callback(search_data)
+                        continue
                     if method == "mean":
                         cur_repr = np.mean(cur_context_data, axis=0)
                         cache_repr = np.mean(cache_data.context_data, axis=0)
@@ -254,7 +290,9 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
         # llm_data = pre_store_data
         if 'messages' in kwargs:
             context_lines = []
-            current_question = kwargs['messages'][-1]["content"][-1]
+            current_question = _message_content_to_text(
+                kwargs['messages'][-1].get("content", "")
+            )
             if len(chat_cache.config.context_a) == 0:
                 kwargs['messages'][-1]["content"] = current_question
             else:

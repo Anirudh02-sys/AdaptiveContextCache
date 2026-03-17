@@ -158,9 +158,19 @@ def _normalize_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
 
 
+def _tokenize_for_f1(text: str) -> List[str]:
+    normalized = _normalize_text(text)
+    if not normalized:
+        return []
+    word_tokens = re.findall(r"\w+", normalized, flags=re.UNICODE)
+    if word_tokens:
+        return word_tokens
+    return list(normalized.replace(" ", ""))
+
+
 def _token_f1(pred: str, gold: str) -> float:
-    p_tokens = _normalize_text(pred).split()
-    g_tokens = _normalize_text(gold).split()
+    p_tokens = _tokenize_for_f1(pred)
+    g_tokens = _tokenize_for_f1(gold)
     if not p_tokens or not g_tokens:
         return 0.0
     p_counts: Dict[str, int] = defaultdict(int)
@@ -192,6 +202,13 @@ def _accuracy_metrics(predicted: str, expected: str) -> Dict[str, float]:
     }
 
 
+def _is_placeholder_response(text: str) -> bool:
+    normalized = _normalize_text(text)
+    if not normalized:
+        return False
+    return "[dry-run]" in normalized or normalized == "dry-run-response"
+
+
 def _percentile(values: Sequence[float], p: float) -> float:
     if not values:
         return 0.0
@@ -219,6 +236,7 @@ class RunState:
         self.error_count = 0
         self.cache_hit_count = 0
         self.cache_miss_count = 0
+        self.placeholder_response_count = 0
         self.latencies_ms: List[float] = []
         self.served_latencies_ms: List[float] = []
         self.accuracy_count = 0
@@ -232,6 +250,7 @@ class RunState:
                 "errors": 0,
                 "cache_hits": 0,
                 "cache_misses": 0,
+                "placeholder_responses": 0,
                 "latencies_ms": [],
                 "served_latencies_ms": [],
                 "accuracy_count": 0,
@@ -247,6 +266,7 @@ class RunState:
         ok: bool,
         latency_ms: float,
         is_cache_hit: Optional[bool] = None,
+        is_placeholder_response: bool = False,
         accuracy: Optional[Dict[str, float]] = None,
     ) -> None:
         with self.lock:
@@ -268,6 +288,9 @@ class RunState:
             elif is_cache_hit is False:
                 self.cache_miss_count += 1
                 self.per_app[app_id]["cache_misses"] += 1
+            if is_placeholder_response:
+                self.placeholder_response_count += 1
+                self.per_app[app_id]["placeholder_responses"] += 1
             if accuracy:
                 self.accuracy_count += 1
                 self.per_app[app_id]["accuracy_count"] += 1
@@ -368,12 +391,13 @@ def _thread_worker(
                 break
 
             content_list = list(history) + [user_prompt]
+            prompt_text = "\n\n".join(content_list)
             payload = {
                 "model": model,
                 "messages": [
                     {
                         "role": "user",
-                        "content": content_list,
+                        "content": prompt_text,
                     }
                 ],
                 "temperature": 0,
@@ -385,8 +409,10 @@ def _thread_worker(
             status_code = 0
             last_err = ""
             is_cache_hit: Optional[bool] = None
+            is_placeholder_response = False
 
             for attempt in range(retry_count + 1):
+                attempt_start = time.time()
                 try:
                     ok, response_text, latency_ms, status_code, is_cache_hit = _request_once(
                         session=session,
@@ -398,19 +424,27 @@ def _thread_worker(
                         dry_run=dry_run,
                     )
                     if ok:
+                        is_placeholder_response = _is_placeholder_response(response_text)
                         break
                     last_err = response_text
                 except Exception as exc:
                     last_err = str(exc)
                     ok = False
-                    latency_ms = 0.0
+                    # Record elapsed time so timeouts/failures don't show as 0 ms
+                    latency_ms = (time.time() - attempt_start) * 1000.0
                     status_code = 0
                 if attempt < retry_count:
                     backoff = (retry_backoff_ms / 1000.0) * (attempt + 1)
                     time.sleep(backoff)
 
             accuracy = None
-            if ok and accuracy_enabled and isinstance(expected_answer, str) and expected_answer.strip():
+            if (
+                ok
+                and not is_placeholder_response
+                and accuracy_enabled
+                and isinstance(expected_answer, str)
+                and expected_answer.strip()
+            ):
                 accuracy = _accuracy_metrics(response_text, expected_answer)
 
             state.add_result(
@@ -418,6 +452,7 @@ def _thread_worker(
                 ok=ok,
                 latency_ms=latency_ms,
                 is_cache_hit=is_cache_hit,
+                is_placeholder_response=is_placeholder_response,
                 accuracy=accuracy,
             )
             used_answer = response_text if ok else f"request_failed: {last_err}"
@@ -437,6 +472,7 @@ def _thread_worker(
                     "status_code": status_code,
                     "latency_ms": round(latency_ms, 3),
                     "cache_hit": is_cache_hit,
+                    "placeholder_response": is_placeholder_response,
                     "request_prompt": user_prompt,
                     "expected_response": expected_answer[:240] if isinstance(expected_answer, str) else "",
                     "response_snippet": used_answer[:240],
@@ -585,6 +621,7 @@ def run(config: Dict[str, Any]) -> Dict[str, Any]:
             "errors": stats["errors"],
             "cache_hits": stats["cache_hits"],
             "cache_misses": stats["cache_misses"],
+            "placeholder_responses": stats["placeholder_responses"],
             "p50_latency_ms": round(_percentile(lat, 50), 3),
             "p95_latency_ms": round(_percentile(lat, 95), 3),
             "p99_latency_ms": p99_latency_all,
@@ -632,6 +669,8 @@ def run(config: Dict[str, Any]) -> Dict[str, Any]:
         "errors": state.error_count,
         "cache_hits": state.cache_hit_count,
         "cache_misses": state.cache_miss_count,
+        "placeholder_response_count": state.placeholder_response_count,
+        "placeholder_response_detected": bool(state.placeholder_response_count),
         "elapsed_seconds": round(elapsed_s, 3),
         "overall_throughput_rps": round(state.request_count / elapsed_s, 3),
         "overall_p50_latency_ms": round(_percentile(lat_all, 50), 3),

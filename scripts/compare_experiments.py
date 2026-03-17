@@ -116,21 +116,29 @@ def plot_accuracy_compare(
     rows0 = _sorted_per_app(nocache)
     app_ids = [app_id for app_id, _ in rows0]
 
-    def acc(m: Dict[str, Any]) -> List[float]:
-        rows = _sorted_per_app(m)
-        return [float(stats.get("avg_sequence_ratio", 0.0)) for _, stats in rows]
+    def accuracy_metric_name(m: Dict[str, Any]) -> str:
+        metric = str(m.get("slo_summary", {}).get("accuracy_metric", "avg_token_f1"))
+        if metric not in {"exact_match_rate", "avg_token_f1", "avg_sequence_ratio"}:
+            return "avg_token_f1"
+        return metric
 
-    a0 = acc(nocache)
-    a1 = acc(gptcache)
-    a2 = acc(contextcache)
+    chosen_metric = accuracy_metric_name(contextcache)
+
+    def acc(m: Dict[str, Any], metric: str) -> List[float]:
+        rows = _sorted_per_app(m)
+        return [float(stats.get(metric, 0.0)) for _, stats in rows]
+
+    a0 = acc(nocache, chosen_metric)
+    a1 = acc(gptcache, chosen_metric)
+    a2 = acc(contextcache, chosen_metric)
 
     fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(app_ids, a0, marker="o", label="no-cache avg_sequence_ratio")
-    ax.plot(app_ids, a1, marker="o", label="gptcache avg_sequence_ratio")
-    ax.plot(app_ids, a2, marker="o", label="contextcache avg_sequence_ratio")
-    ax.set_title("Accuracy (avg_sequence_ratio) by Application (All Experiments)")
+    ax.plot(app_ids, a0, marker="o", label=f"no-cache {chosen_metric}")
+    ax.plot(app_ids, a1, marker="o", label=f"gptcache {chosen_metric}")
+    ax.plot(app_ids, a2, marker="o", label=f"contextcache {chosen_metric}")
+    ax.set_title(f"Accuracy ({chosen_metric}) by Application (All Experiments)")
     ax.set_xlabel("Application ID")
-    ax.set_ylabel("avg_sequence_ratio")
+    ax.set_ylabel(chosen_metric)
     ax.grid(alpha=0.3)
     ax.legend()
     return _save(fig, output_dir, f"{prefix}_accuracy_compare.png")
