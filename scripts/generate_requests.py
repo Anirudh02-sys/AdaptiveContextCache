@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+add optional cache prewarm that populates our cache before experiment begins
+prewarm uses the same request format as experiment
+
 Multithreaded request generator for application-grouped conversation files.
 
 Reads `application_*.jsonl`, spawns multiple threads per application, and sends
@@ -77,6 +80,25 @@ def _load_app_records(config: Dict[str, Any]) -> Dict[int, List[Dict[str, Any]]]
                     continue
                 app_records[app_id].append(json.loads(line))
     return app_records
+
+def _load_warmup_records(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    data_dir = config["data_dir"]
+    warmup_file = config.get("warmup_file")
+    if not warmup_file:
+        raise ValueError("config must specify warmup_file")
+
+    path = os.path.join(data_dir, warmup_file)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"warmup file not found at: {path}")
+     
+    records: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            records.append(json.loads(line))
+    return records
 
 
 def _pairs_from_record(record: Dict[str, Any]) -> List[Tuple[str, str]]:
@@ -510,8 +532,218 @@ def _split_for_threads(
         buckets[idx % len(buckets)].append(conv)
     return buckets
 
+def _run_warmup_conversation(
+    conversation: Dict[str, Any],
+    config: Dict[str, Any],
+    session: requests.Session,
+    headers: Dict[str, str],
+    warmup_log_path: str,
+    log_lock: threading.Lock,
+) -> Dict[str, int]:
+    retry_count = int(config.get("retry_count", 1))
+    retry_backoff_ms = int(config.get("retry_backoff_ms", 200))
+    timeout_s = float(config.get("timeout_seconds", 30))
+    dry_run = bool(config.get("dry_run", False))
+    endpoint = str(config.get("endpoint", "/v1/chat/completions"))
+    base_url = str(config.get("base_url", "http://127.0.0.1:8012"))
+    model = str(config.get("model", "gpt-3.5-turbo"))
+    max_turns = int(config.get("max_turns_per_conversation", 0))
+
+    pairs = _pairs_from_record(conversation)
+    if max_turns > 0:
+        pairs = pairs[:max_turns]
+
+    if not pairs:
+        return {
+            "requests_sent": 0,
+            "success": 0,
+            "errors": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+        }
+
+    history: List[str] = []
+    conversation_id = str(conversation.get("conversation_id", "unknown"))
+
+    request_count = 0
+    success_count = 0
+    error_count = 0
+    cache_hit_count = 0
+    cache_miss_count = 0
+
+    for turn_idx, (user_prompt, expected_answer) in enumerate(pairs, start=1):
+        content_list = list(history) + [user_prompt]
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": content_list,
+                }
+            ],
+            "temperature": 0,
+        }
+
+        ok = False
+        response_text = ""
+        latency_ms = 0.0
+        status_code = 0
+        last_err = ""
+        is_cache_hit: Optional[bool] = None
+
+        for attempt in range(retry_count + 1):
+            try:
+                ok, response_text, latency_ms, status_code, is_cache_hit = _request_once(
+                    session=session,
+                    base_url=base_url,
+                    endpoint=endpoint,
+                    headers=headers,
+                    payload=payload,
+                    timeout_s=timeout_s,
+                    dry_run=dry_run,
+                )
+                if ok:
+                    break
+                last_err = response_text
+            except Exception as exc:
+                last_err = str(exc)
+                ok = False
+                latency_ms = 0.0
+                status_code = 0
+
+            if attempt < retry_count:
+                backoff = (retry_backoff_ms / 1000.0) * (attempt + 1)
+                time.sleep(backoff)
+
+        request_count += 1
+        if ok:
+            success_count += 1
+        else:
+            error_count += 1
+
+        if is_cache_hit is True:
+            cache_hit_count += 1
+        elif is_cache_hit is False:
+            cache_miss_count += 1
+
+        used_answer = response_text if ok else f"request_failed: {last_err}"
+
+        history.append(f"Previous user question: {user_prompt}")
+        history.append(f"Previous model response: {used_answer}")
+
+        if warmup_log_path:
+            entry = {
+                "entry_type": "warmup_request",
+                "timestamp": time.time(),
+                "conversation_id": conversation_id,
+                "turn_index": turn_idx,
+                "ok": ok,
+                "status_code": status_code,
+                "latency_ms": round(latency_ms, 3),
+                "cache_hit": is_cache_hit,
+                "request_prompt": user_prompt,
+                "expected_response": expected_answer[:240] if isinstance(expected_answer, str) else "",
+                "response_snippet": used_answer[:240],
+                "request_content_count": len(content_list),
+            }
+            with log_lock:
+                with open(warmup_log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    return {
+        "requests_sent": request_count,
+        "success": success_count,
+        "errors": error_count,
+        "cache_hits": cache_hit_count,
+        "cache_misses": cache_miss_count,
+    }
+
+
+def _run_warmup_phase(
+    warmup_records: Sequence[Dict[str, Any]],
+    config: Dict[str, Any],
+    warmup_log_path: str,
+) -> Dict[str, Any]:
+    if not warmup_records:
+        return {
+            "entry_type": "warmup_summary",
+            "conversations_seen": 0,
+            "requests_sent": 0,
+            "success": 0,
+            "errors": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "elapsed_seconds": 0.0,
+        }
+
+    api_key_env = str(config.get("api_key_env", "OPENAI_API_KEY"))
+    api_key = os.getenv(api_key_env, "")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    session = requests.Session()
+    log_lock = threading.Lock()
+
+    started_at = time.time()
+    request_count = 0
+    success_count = 0
+    error_count = 0
+    cache_hit_count = 0
+    cache_miss_count = 0
+
+    for conversation in warmup_records:
+        conv_result = _run_warmup_conversation(
+            conversation=conversation,
+            config=config,
+            session=session,
+            headers=headers,
+            warmup_log_path=warmup_log_path,
+            log_lock=log_lock,
+        )
+        request_count += int(conv_result["requests_sent"])
+        success_count += int(conv_result["success"])
+        error_count += int(conv_result["errors"])
+        cache_hit_count += int(conv_result["cache_hits"])
+        cache_miss_count += int(conv_result["cache_misses"])
+
+    elapsed_s = max(0.001, time.time() - started_at)
+
+    summary = {
+        "entry_type": "warmup_summary",
+        "conversations_seen": len(warmup_records),
+        "requests_sent": request_count,
+        "success": success_count,
+        "errors": error_count,
+        "cache_hits": cache_hit_count,
+        "cache_misses": cache_miss_count,
+        "elapsed_seconds": round(elapsed_s, 3),
+    }
+
+    if warmup_log_path:
+        with log_lock:
+            with open(warmup_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(summary, ensure_ascii=False) + "\n")
+
+    return summary
 
 def run(config: Dict[str, Any]) -> Dict[str, Any]:
+    warmup_log_path = str(config.get("warmup_log_path", "")).strip()
+    if warmup_log_path:
+        warmup_log_parent = os.path.dirname(warmup_log_path)
+        if warmup_log_parent:
+            os.makedirs(warmup_log_parent, exist_ok=True)
+        with open(warmup_log_path, "w", encoding="utf-8") as f:
+            f.write("")
+    warmup_summary = None
+    warmup_enabled = bool(config.get("warmup_enabled", False))
+    if warmup_enabled:
+        warmup_records = _load_warmup_records(config)
+        warmup_summary = _run_warmup_phase(warmup_records, config, warmup_log_path)
+
+    print("prewarm complete")
+    print(json.dumps(warmup_summary, ensure_ascii=False, indent=2))
+
     app_records = _load_app_records(config)
     if not app_records:
         raise RuntimeError("No application data files matched config.")
