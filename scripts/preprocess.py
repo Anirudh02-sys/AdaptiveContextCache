@@ -399,13 +399,18 @@ def main() -> None:
         warmup_ratio=args.warmup_ratio,
         eval_count=args.eval_count,
     )
+    warmup_rows_with_pairs = []
+    for row in warmup_rows:
+        new_row = dict(row)
+        new_row["turn_pairs"] = _build_pairs(row.get("turns", []))
+        warmup_rows_with_pairs.append(new_row)
 
     warmup_path = os.path.join(args.output_dir, f"{label}_warmup_{len(warmup_rows)}.jsonl")
     eval_path = os.path.join(args.output_dir, f"{label}_eval_{len(eval_rows)}.jsonl")
     apps_output_dir = os.path.join(args.output_dir, f"{label}_eval_{len(eval_rows)}_apps")
     split_manifest_path = os.path.join(args.output_dir, f"{label}_split_manifest.json")
 
-    write_jsonl(warmup_path, warmup_rows)
+    write_jsonl(warmup_path, warmup_rows_with_pairs)
     write_jsonl(eval_path, eval_rows)
 
     print(f"Wrote warmup file: {warmup_path}")
