@@ -5,6 +5,8 @@
   "api_key_env": "VOCAREUM_API_KEY",
   "data_dir": "data/",
   "file_glob": "application_*.jsonl",
+  "warmup_file": "min_turns_10_warmup_2220.jsonl",
+  "warmup_enabled": true,
   "applications": [
     0,
     1,
@@ -98,5 +100,6 @@
   "timeout_seconds": 30,
   "max_workers": 16,
   "output_metrics_path": "data/test_apps/request_metrics.json",
-  "output_request_log_path": "data/test_apps/request_log.jsonl"
+  "output_request_log_path": "data/test_apps/request_log.jsonl",
+  "warmup_log_path": "data/prewarm/warmup_log.jsonl"
 }
