@@ -452,7 +452,6 @@ def _thread_worker(
                 except Exception as exc:
                     last_err = str(exc)
                     ok = False
-                    # Record elapsed time so timeouts/failures don't show as 0 ms
                     latency_ms = (time.time() - attempt_start) * 1000.0
                     status_code = 0
                 if attempt < retry_count:
@@ -573,12 +572,13 @@ def _run_warmup_conversation(
 
     for turn_idx, (user_prompt, expected_answer) in enumerate(pairs, start=1):
         content_list = list(history) + [user_prompt]
+        prompt_text = "\n\n".join(content_list)
         payload = {
             "model": model,
             "messages": [
                 {
                     "role": "user",
-                    "content": content_list,
+                    "content": prompt_text,
                 }
             ],
             "temperature": 0,
@@ -592,6 +592,7 @@ def _run_warmup_conversation(
         is_cache_hit: Optional[bool] = None
 
         for attempt in range(retry_count + 1):
+            attempt_start = time.time()
             try:
                 ok, response_text, latency_ms, status_code, is_cache_hit = _request_once(
                     session=session,
@@ -608,7 +609,7 @@ def _run_warmup_conversation(
             except Exception as exc:
                 last_err = str(exc)
                 ok = False
-                latency_ms = 0.0
+                latency_ms = (time.time() - attempt_start) * 1000.0
                 status_code = 0
 
             if attempt < retry_count:
@@ -741,8 +742,8 @@ def run(config: Dict[str, Any]) -> Dict[str, Any]:
         warmup_records = _load_warmup_records(config)
         warmup_summary = _run_warmup_phase(warmup_records, config, warmup_log_path)
 
-    print("prewarm complete")
-    print(json.dumps(warmup_summary, ensure_ascii=False, indent=2))
+    if warmup_summary is not None:
+        print(json.dumps(warmup_summary, ensure_ascii=False, indent=2))
 
     app_records = _load_app_records(config)
     if not app_records:
