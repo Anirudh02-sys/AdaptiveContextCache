@@ -106,6 +106,86 @@ def plot_latency_compare(
     return _save(fig, output_dir, f"{prefix}_latency_compare.png")
 
 
+def _infer_log_path_from_metrics(metrics_path: str, mode_suffix: str) -> str:
+    """
+    Metrics are written as:
+      request_metrics_{mode_suffix}.json
+    Logs are written as:
+      request_log_{mode_suffix}.jsonl
+    """
+    base_dir = os.path.dirname(metrics_path)
+    return os.path.join(base_dir, f"request_log_{mode_suffix}.jsonl")
+
+
+def _load_avg_latency_ms_from_log(log_path: str) -> Dict[int, float]:
+    sums: Dict[int, float] = {}
+    counts: Dict[int, int] = {}
+
+    if not os.path.exists(log_path):
+        return {}
+
+    with open(log_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if obj.get("ok") is not True:
+                continue
+            app_id = obj.get("application_id")
+            latency_ms = obj.get("latency_ms")
+            if app_id is None or latency_ms is None:
+                continue
+            app_id_int = int(app_id)
+            sums[app_id_int] = sums.get(app_id_int, 0.0) + float(latency_ms)
+            counts[app_id_int] = counts.get(app_id_int, 0) + 1
+
+    out: Dict[int, float] = {}
+    for app_id_int, total in sums.items():
+        c = counts.get(app_id_int, 0)
+        out[app_id_int] = (total / c) if c else 0.0
+    return out
+
+
+def plot_avg_latency_compare(
+    nocache_metrics: Dict[str, Any],
+    gptcache_metrics: Dict[str, Any],
+    contextcache_metrics: Dict[str, Any],
+    nocache_metrics_path: str,
+    gptcache_metrics_path: str,
+    contextcache_metrics_path: str,
+    output_dir: str,
+    prefix: str,
+) -> str:
+    rows0 = _sorted_per_app(nocache_metrics)
+    app_ids = [app_id for app_id, _ in rows0]
+
+    avg0 = _load_avg_latency_ms_from_log(
+        _infer_log_path_from_metrics(nocache_metrics_path, "nocache")
+    )
+    avg1 = _load_avg_latency_ms_from_log(
+        _infer_log_path_from_metrics(gptcache_metrics_path, "gptcache")
+    )
+    avg2 = _load_avg_latency_ms_from_log(
+        _infer_log_path_from_metrics(contextcache_metrics_path, "contextcache")
+    )
+
+    p0 = [float(avg0.get(app_id, 0.0)) for app_id in app_ids]
+    p1 = [float(avg1.get(app_id, 0.0)) for app_id in app_ids]
+    p2 = [float(avg2.get(app_id, 0.0)) for app_id in app_ids]
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(app_ids, p0, marker="o", label="no-cache avg (ms)")
+    ax.plot(app_ids, p1, marker="o", label="gptcache avg (ms)")
+    ax.plot(app_ids, p2, marker="o", label="contextcache avg (ms)")
+    ax.set_title("Average Latency by Application (All Experiments)")
+    ax.set_xlabel("Application ID")
+    ax.set_ylabel("Average latency (ms)")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    return _save(fig, output_dir, f"{prefix}_latency_avg_compare.png")
+
+
 def plot_accuracy_compare(
     nocache: Dict[str, Any],
     gptcache: Dict[str, Any],
@@ -248,6 +328,16 @@ def main() -> None:
     contextcache = _load_json(args.metrics_contextcache)
 
     latency_plot = plot_latency_compare(nocache, gptcache, contextcache, args.output_dir, args.prefix)
+    avg_latency_plot = plot_avg_latency_compare(
+        nocache,
+        gptcache,
+        contextcache,
+        args.metrics_nocache,
+        args.metrics_gptcache,
+        args.metrics_contextcache,
+        args.output_dir,
+        args.prefix,
+    )
     accuracy_plot = plot_accuracy_compare(
         nocache, gptcache, contextcache, args.output_dir, args.prefix
     )
@@ -257,6 +347,7 @@ def main() -> None:
 
     print("Wrote comparison plots:")
     print(f"- {latency_plot}")
+    print(f"- {avg_latency_plot}")
     print(f"- {accuracy_plot}")
     print(f"- {lat_slo_plot}")
     print(f"- {acc_slo_plot}")

@@ -413,13 +413,16 @@ def _thread_worker(
                 break
 
             content_list = list(history) + [user_prompt]
-            prompt_text = "\n\n".join(content_list)
             payload = {
                 "model": model,
                 "messages": [
                     {
                         "role": "user",
-                        "content": prompt_text,
+                        # Adapter-side preprocessing (`gptcache/processor/pre.py::last_content`)
+                        # treats list-like content as: [history..., current_user_prompt].
+                        # This enables true two-stage retrieval: stage-1 uses only the
+                        # current prompt, stage-2 uses extracted `context_res`.
+                        "content": content_list,
                     }
                 ],
                 "temperature": 0,

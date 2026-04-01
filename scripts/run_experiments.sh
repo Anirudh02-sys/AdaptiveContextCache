@@ -12,20 +12,28 @@ set -euo pipefail
 #
 # DRY_RUN controls the server's upstream dry-run flag (--dry-run yes).
 
-DRY_RUN="${DRY_RUN:-yes}"          # yes|no -> passed to server
+DRY_RUN="${DRY_RUN:-no}"          # yes|no -> passed to server
 CACHE_DIR="${CACHE_DIR:-/tmp/contextcache_data}"
 EXAMPLE_CONFIG="config/request_gen.example.json"
 METRICS_BASE_DIR="data/test_apps/example"
 PLOTS_BASE_DIR="${METRICS_BASE_DIR}/plots"
 
-# Hard-code API key and base URL for downstream OpenAI-compatible calls.
-# Replace the placeholder values below with your real credentials/URL.
+# API keys must come from the environment — never commit real credentials.
+# Example before running:
+#   export OPENAI_API_KEY=...
+#   export OPENAI_API_BASE=https://api.openai.com/v1
+#   export VOCAREUM_API_KEY=...
+#   export VOCAREUM_BASE_URL=https://genai.vocareum.com/v1
 
-OPENAI_API_KEY_VALUE= # Fill in your own API key
-OPENAI_API_BASE_VALUE= # Fill in your own API base URL
+OPENAI_API_KEY_VALUE="${OPENAI_API_KEY:-}"
+OPENAI_API_BASE_VALUE="${OPENAI_API_BASE:-https://api.openai.com/v1}"
+VOCAREUM_API_KEY_VALUE="${VOCAREUM_API_KEY:-}"
+VOCAREUM_API_BASE_VALUE="${VOCAREUM_BASE_URL:-https://genai.vocareum.com/v1}"
 
-export OPENAI_API_KEY="${OPENAI_API_KEY_VALUE}"
-export OPENAI_API_BASE="${OPENAI_API_BASE_VALUE}"
+# export OPENAI_API_KEY="${OPENAI_API_KEY_VALUE}"
+# export OPENAI_API_BASE="${OPENAI_API_BASE_VALUE}"
+export VOCAREUM_API_KEY="${VOCAREUM_API_KEY_VALUE}"
+export VOCAREUM_BASE_URL="${VOCAREUM_API_BASE_VALUE}"
 
 mkdir -p "${METRICS_BASE_DIR}"
 mkdir -p "${PLOTS_BASE_DIR}"
@@ -128,3 +136,10 @@ python3 scripts/compare_experiments.py \
   --output-dir "${compare_output_dir}" \
   --prefix "compare"
 
+# Presentation figures: per-application SLOs + request generation stats.
+SLO_WORKLOAD_DIR="${PLOTS_BASE_DIR}/slo_workload"
+mkdir -p "${SLO_WORKLOAD_DIR}"
+python3 scripts/visualize_app_slos_and_workload.py \
+  --config "${EXAMPLE_CONFIG}" \
+  --output-dir "${SLO_WORKLOAD_DIR}" \
+  --prefix "request_gen_example"

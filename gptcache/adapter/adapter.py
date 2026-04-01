@@ -8,6 +8,40 @@ from gptcache.utils.log import gptcache_log
 from gptcache.utils.time import time_cal
 
 
+def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
+    if denom <= 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+
+def _attention_pool_last_query(context_seq: np.ndarray) -> np.ndarray:
+    """
+    Deterministic dot-product attention pooling.
+
+    Uses the last vector in the sequence as the query and attends over the full
+    sequence to produce a weighted sum. This wires an attention-style aggregation
+    without requiring a trained checkpoint.
+    """
+    seq = np.asarray(context_seq, dtype=np.float32)
+    if seq.ndim != 2 or seq.shape[0] == 0:
+        # Best-effort safe fallback
+        if seq.ndim == 2 and seq.shape[1] > 0:
+            return np.zeros((seq.shape[1],), dtype=np.float32)
+        return np.zeros((0,), dtype=np.float32)
+    q = seq[-1]  # [d]
+    k = seq      # [t, d]
+    v = seq      # [t, d]
+    scale = float(np.sqrt(max(1, q.shape[0])))
+    logits = (k @ q) / (scale + 1e-12)  # [t]
+    logits = logits - float(np.max(logits))
+    w = np.exp(logits)
+    w = w / (float(np.sum(w)) + 1e-12)  # [t]
+    return (w[:, None] * v).sum(axis=0)  # [d]
+
+
 def _message_content_to_text(content):
     """Normalize OpenAI message content to plain text."""
     if isinstance(content, str):
@@ -135,18 +169,44 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
 
         cache_answers = []
         # get current context embedding
-        if len(chat_cache.config.context_a) > 0:
-            pre_id = cur_id - 1
-            cur_context_data = chat_cache.config.context_emb
-            if cur_context_data is None:
-                cur_context_data = [
+        # - context_res comes from pre_embedding_func (`last_content`), and represents
+        #   all turns *except* the current query.
+        # - For `gptcache` baseline we must not use dialogue-history context.
+        if ignore_context:
+            chat_cache.config.context_emb = [embedding_data]
+            cur_context_data = np.array([embedding_data])
+            pre_id = -1
+        elif context_res:
+            # Compute dialogue-history embeddings from extracted context_res.
+            cur_context_data = [
                 time_cal(
                     chat_cache.embedding_func,
                     func_name="embedding",
                     report_func=chat_cache.report.embedding,
-                )(ori_data, extra_param=context.get("embedding_func", None)) 
-                for ori_data in  context_res]
-            if chat_cache.config.set_use_api == False:
+                )(ori_data, extra_param=context.get("embedding_func", None))
+                for ori_data in context_res
+            ]
+            # Append current-query embedding as the last element in context_data.
+            cur_context_data.append(embedding_data)
+            if len(cur_context_data) > 5:
+                cur_context_data = cur_context_data[-5:]
+            chat_cache.config.context_emb = cur_context_data
+            cur_context_data = np.array(cur_context_data)
+            pre_id = cur_id - 1
+        elif len(chat_cache.config.context_a) > 0:
+            # Fallback for any legacy code paths that use config.context_a.
+            pre_id = cur_id - 1
+            cur_context_data = chat_cache.config.context_emb
+            if cur_context_data is None:
+                cur_context_data = [
+                    time_cal(
+                        chat_cache.embedding_func,
+                        func_name="embedding",
+                        report_func=chat_cache.report.embedding,
+                    )(ori_data, extra_param=context.get("embedding_func", None))
+                    for ori_data in context_res
+                ]
+            if chat_cache.config.set_use_api is False:
                 cur_context_data.append(embedding_data)
             if len(cur_context_data) > 5:
                 cur_context_data = cur_context_data[-5:]
@@ -213,7 +273,9 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                         context_norm = np.linalg.norm(cur_repr) * np.linalg.norm(cache_repr)
                         context_rank = context_dot / context_norm
                     elif method == "attention":
-                        context_rank = 0
+                        cur_repr = _attention_pool_last_query(cur_context_data)
+                        cache_repr = _attention_pool_last_query(cache_data.context_data)
+                        context_rank = _cosine_sim(cur_repr, cache_repr)
 
                     if context_rank > dialuoge_threshold:
                         cache_answers.append(
@@ -385,7 +447,13 @@ async def aadapt(
         raise NotInitError()
     cache_enable = chat_cache.cache_enable_func(*args, **kwargs)
     context = kwargs.pop("cache_context", {})
+    ignore_context = bool(context.get("ignore_context", False))
     embedding_data = None
+    # Used by both hit and miss paths; must be defined even when `cache_skip=True`
+    # (e.g., `server_mode=no-cache`).
+    cur_id = chat_cache.config.cur_id
+    pre_id = -1
+    cur_context_data = None
     # you want to retry to send the request to chatgpt when the cache is negative
 
     if 0 < temperature < 2:
@@ -463,7 +531,29 @@ async def aadapt(
             else rank_threshold
         )
         
-        cur_context_data = None
+        cur_id = chat_cache.config.cur_id
+        if ignore_context:
+            pre_id = -1
+            cur_context_data = np.array([embedding_data])
+        elif context_res:
+            # Compute dialogue-history embeddings from extracted context_res.
+            cur_context_data = [
+                time_cal(
+                    chat_cache.embedding_func,
+                    func_name="embedding",
+                    report_func=chat_cache.report.embedding,
+                )(ori_data, extra_param=context.get("embedding_func", None))
+                for ori_data in context_res
+            ]
+            cur_context_data.append(embedding_data)
+            if len(cur_context_data) > 5:
+                cur_context_data = cur_context_data[-5:]
+            cur_context_data = np.array(cur_context_data)
+            pre_id = cur_id - 1
+        else:
+            pre_id = -1
+            cur_context_data = np.array([embedding_data])
+
         context_datas = [cur_context_data]
         ans_datas = []
         cache_datas = []
@@ -541,6 +631,13 @@ async def aadapt(
                     question = pre_store_data
                 else:
                     question.content = pre_store_data
+                context_for_save = cur_context_data
+                if context_for_save is None:
+                    context_for_save = (
+                        np.array([embedding_data])
+                        if embedding_data is not None
+                        else np.array([])
+                    )
                 time_cal(
                     chat_cache.data_manager.save,
                     func_name="save",
@@ -549,6 +646,9 @@ async def aadapt(
                     question,
                     handled_llm_data,
                     embedding_data,
+                    context_for_save,
+                    cur_id,
+                    pre_id,
                     extra_param=context.get("save_func", None),
                     session=session,
                 )
@@ -563,6 +663,9 @@ async def aadapt(
             )
         except Exception:  # pylint: disable=W0703
             gptcache_log.error("failed to save the data to cache", exc_info=True)
+
+    # Only advance `cur_id` on miss paths (hit paths `return` early above).
+    chat_cache.config.cur_id = chat_cache.config.cur_id + 1
     return llm_data
 
 
