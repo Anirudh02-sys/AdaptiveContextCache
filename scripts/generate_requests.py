@@ -575,13 +575,14 @@ def _run_warmup_conversation(
 
     for turn_idx, (user_prompt, expected_answer) in enumerate(pairs, start=1):
         content_list = list(history) + [user_prompt]
-        prompt_text = "\n\n".join(content_list)
         payload = {
             "model": model,
             "messages": [
                 {
                     "role": "user",
-                    "content": prompt_text,
+                    # Same shape as `_thread_worker`: list content so `last_content` can
+                    # split current query vs `context_res` (contextcache / gptcache baselines).
+                    "content": content_list,
                 }
             ],
             "temperature": 0,
