@@ -140,3 +140,5 @@ dmypy.json
 **/.chroma
 docs/references/*
 !docs/references/index.rst
+
+config/*.local.json
