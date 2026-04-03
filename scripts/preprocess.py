@@ -180,26 +180,19 @@ def write_jsonl(path: str, rows: Sequence[Dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def split_warmup_eval(
+def split_warmup_pool(
     rows: Sequence[Dict[str, Any]],
     warmup_ratio: float,
-    eval_count: int,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+    rng,
+) -> Tuple[List[Dict[str, Any]], int]:
     total = len(rows)
     if total == 0:
         raise ValueError("Input JSONL has no rows")
 
     warmup_n = math.ceil(total * warmup_ratio)
-    warmup_rows = list(rows[:warmup_n])
-    eval_rows = list(rows[warmup_n : warmup_n + eval_count])
+    warmup_rows = rng.sample(rows, warmup_n)
 
-    if len(eval_rows) < eval_count:
-        raise ValueError(
-            f"Not enough rows after warmup. total={total}, warmup={warmup_n}, "
-            f"requested eval_count={eval_count}, got eval={len(eval_rows)}"
-        )
-
-    return warmup_rows, eval_rows, warmup_n
+    return warmup_rows, warmup_n
 
 
 def _build_pairs(turns: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -387,6 +380,9 @@ def main() -> None:
     args = parse_args()
     np.random.seed(args.seed)
 
+    import random
+    rng = random.Random(args.seed)
+
     label = args.dataset_label or os.path.splitext(os.path.basename(args.input_file))[0]
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -394,16 +390,24 @@ def main() -> None:
     rows = load_jsonl(args.input_file)
     print(f"Loaded rows: {len(rows)}")
 
-    warmup_rows, eval_rows, warmup_n = split_warmup_eval(
+    warmup_rows, warmup_n = split_warmup_pool(
         rows,
         warmup_ratio=args.warmup_ratio,
-        eval_count=args.eval_count,
+        rng=rng
     )
     warmup_rows_with_pairs = []
     for row in warmup_rows:
         new_row = dict(row)
         new_row["turn_pairs"] = _build_pairs(row.get("turns", []))
         warmup_rows_with_pairs.append(new_row)
+
+    if len(warmup_rows_with_pairs) < args.eval_count:
+        raise ValueError(
+            f"Warmup pool smaller than eval_count. "
+            f"warmup={len(warmup_rows_with_pairs)}, eval_count={args.eval_count}"
+        )
+
+    eval_rows = rng.sample(warmup_rows_with_pairs, args.eval_count)
 
     warmup_path = os.path.join(args.output_dir, f"{label}_warmup_{len(warmup_rows)}.jsonl")
     eval_path = os.path.join(args.output_dir, f"{label}_eval_{len(eval_rows)}.jsonl")
@@ -461,9 +465,11 @@ def main() -> None:
         "warmup_ratio": args.warmup_ratio,
         "warmup_count": len(warmup_rows),
         "eval_count": len(eval_rows),
-        "non_overlap": {
-            "warmup_indices": [0, warmup_n - 1] if warmup_n > 0 else None,
-            "eval_indices": [warmup_n, warmup_n + len(eval_rows) - 1] if eval_rows else None,
+        "sampling": {
+            "warmup_random_sample": True,
+            "eval_random_sample_from_warmup": True,
+            "overlap": True,
+            "seed": args.seed,
         },
         "warmup_file": warmup_path,
         "eval_file": eval_path,
