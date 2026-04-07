@@ -22,8 +22,8 @@ PLOTS_BASE_DIR="${METRICS_BASE_DIR}/plots"
 # Example before running:
 #   export OPENAI_API_KEY=...
 #   export OPENAI_API_BASE=https://api.openai.com/v1
-#   export VOCAREUM_API_KEY=...
-#   export VOCAREUM_BASE_URL=https://genai.vocareum.com/v1
+export VOCAREUM_API_KEY=voc-1418745524204245488322369b6ea35cacbb5.02522614
+export VOCAREUM_BASE_URL=https://genai.vocareum.com/v1
 
 OPENAI_API_KEY_VALUE="${OPENAI_API_KEY:-}"
 OPENAI_API_BASE_VALUE="${OPENAI_API_BASE:-https://api.openai.com/v1}"
@@ -85,11 +85,27 @@ run_experiment() {
   local log_path="${METRICS_BASE_DIR}/request_log_${suffix}.jsonl"
   local model="gpt-3.5-turbo" # or "@azure-1/gpt-4o"
 
-  jq \
-    --arg metrics_path "${metrics_path}" \
-    --arg log_path "${log_path}" \
-    '.output_metrics_path = $metrics_path | .output_request_log_path = $log_path' \
-    "${EXAMPLE_CONFIG}" > "${tmp_config}"
+  local baseline_abs="${PWD}/${METRICS_BASE_DIR}/request_log_nocache.jsonl"
+  if [[ "${suffix}" == "nocache" ]]; then
+    jq \
+      --arg metrics_path "${metrics_path}" \
+      --arg log_path "${log_path}" \
+      '.output_metrics_path = $metrics_path
+        | .output_request_log_path = $log_path
+        | .accuracy_baseline_reference_run = true
+        | .accuracy_baseline_log_path = ""' \
+      "${EXAMPLE_CONFIG}" > "${tmp_config}"
+  else
+    jq \
+      --arg metrics_path "${metrics_path}" \
+      --arg log_path "${log_path}" \
+      --arg baseline "${baseline_abs}" \
+      '.output_metrics_path = $metrics_path
+        | .output_request_log_path = $log_path
+        | .accuracy_baseline_reference_run = false
+        | .accuracy_baseline_log_path = $baseline' \
+      "${EXAMPLE_CONFIG}" > "${tmp_config}"
+  fi
 
   local server_cmd=("${server_cmd_base[@]}" "--server-mode" "${mode}")
   "${server_cmd[@]}" &

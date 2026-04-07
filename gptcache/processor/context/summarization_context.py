@@ -10,6 +10,22 @@ import_huggingface()
 import transformers  # pylint: disable=C0413
 
 
+def _summarization_pipeline(model_name: str):
+    """HF `summarization` was removed from the pipeline registry in newer transformers."""
+    try:
+        return transformers.pipeline(task="summarization", model=model_name)
+    except KeyError:
+        return transformers.pipeline(task="text2text-generation", model=model_name)
+
+
+def _summary_output_text(batch_item: dict) -> str:
+    if "summary_text" in batch_item:
+        return batch_item["summary_text"]
+    if "generated_text" in batch_item:
+        return batch_item["generated_text"]
+    raise KeyError(f"Unexpected pipeline output keys: {batch_item.keys()}")
+
+
 def summarize_to_length(summarizer, text, target_len, max_len=1024):
     tokenizer = summarizer.tokenizer
 
@@ -31,7 +47,7 @@ def summarize_to_length(summarizer, text, target_len, max_len=1024):
                 min_length=max(len_seg - 10, 1),
                 max_length=len_seg,
             )
-            summary_result += summary[0]["summary_text"]
+            summary_result += _summary_output_text(summary[0])
         text = summary_result
     return summary_result
 
@@ -59,8 +75,7 @@ class SummarizationContextProcess(ContextProcess):
     def __init__(
         self, model_name="facebook/bart-large-cnn", tokenizer=None, target_length=512
     ):
-        summarizer = transformers.pipeline(task="summarization", model=model_name)
-        self.summarizer = summarizer
+        self.summarizer = _summarization_pipeline(model_name)
         self.target_length = target_length
         if tokenizer is None:
             tokenizer = transformers.RobertaTokenizer.from_pretrained("roberta-base")

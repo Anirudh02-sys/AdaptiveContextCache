@@ -1,4 +1,5 @@
 import time
+
 import numpy as np
 
 from gptcache import cache
@@ -112,6 +113,12 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
     else:  # temperature <= 0
         cache_skip = kwargs.pop("cache_skip", False)
     cache_factor = kwargs.pop("cache_factor", 1.0)
+    _raw_app = kwargs.pop("application_id", None)
+    _application_id = (
+        str(_raw_app).strip()
+        if _raw_app is not None and str(_raw_app).strip()
+        else None
+    )
 
     # get current query and optional context from kwargs
     pre_process_res = time_cal(
@@ -188,8 +195,9 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
             ]
             # Append current-query embedding as the last element in context_data.
             cur_context_data.append(embedding_data)
-            if len(cur_context_data) > 5:
-                cur_context_data = cur_context_data[-5:]
+            _cw = chat_cache.config.effective_context_window_len(_application_id)
+            if len(cur_context_data) > _cw:
+                cur_context_data = cur_context_data[-_cw:]
             chat_cache.config.context_emb = cur_context_data
             cur_context_data = np.array(cur_context_data)
             pre_id = cur_id - 1
@@ -208,8 +216,9 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                 ]
             if chat_cache.config.set_use_api is False:
                 cur_context_data.append(embedding_data)
-            if len(cur_context_data) > 5:
-                cur_context_data = cur_context_data[-5:]
+            _cw = chat_cache.config.effective_context_window_len(_application_id)
+            if len(cur_context_data) > _cw:
+                cur_context_data = cur_context_data[-_cw:]
             chat_cache.config.context_emb = cur_context_data
             cur_context_data = np.array(cur_context_data)
         else:
@@ -345,6 +354,8 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
         kwargs["cache_context"] = context
         kwargs["cache_skip"] = cache_skip
         kwargs["cache_factor"] = cache_factor
+        if _application_id is not None:
+            kwargs["application_id"] = _application_id
         llm_data = adapt(
             llm_handler, cache_data_convert, update_cache_callback, *args, **kwargs
         )
@@ -472,6 +483,12 @@ async def aadapt(
     else:  # temperature <= 0
         cache_skip = kwargs.pop("cache_skip", False)
     cache_factor = kwargs.pop("cache_factor", 1.0)
+    _raw_app = kwargs.pop("application_id", None)
+    _application_id = (
+        str(_raw_app).strip()
+        if _raw_app is not None and str(_raw_app).strip()
+        else None
+    )
     pre_process_res = time_cal(
         chat_cache.pre_embedding_func,
         func_name="pre_process",
@@ -546,8 +563,9 @@ async def aadapt(
                 for ori_data in context_res
             ]
             cur_context_data.append(embedding_data)
-            if len(cur_context_data) > 5:
-                cur_context_data = cur_context_data[-5:]
+            _cw = chat_cache.config.effective_context_window_len(_application_id)
+            if len(cur_context_data) > _cw:
+                cur_context_data = cur_context_data[-_cw:]
             cur_context_data = np.array(cur_context_data)
             pre_id = cur_id - 1
         else:
@@ -617,6 +635,8 @@ async def aadapt(
         kwargs["cache_context"] = context
         kwargs["cache_skip"] = cache_skip
         kwargs["cache_factor"] = cache_factor
+        if _application_id is not None:
+            kwargs["application_id"] = _application_id
         llm_data = adapt(
             llm_handler, cache_data_convert, update_cache_callback, *args, **kwargs
         )

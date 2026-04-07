@@ -1,0 +1,142 @@
+"""Sliding-window load stats and load-based context window scaling (thread-safe)."""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from collections import deque
+from typing import Any, Deque, Tuple
+
+_logger = logging.getLogger(__name__)
+
+
+class LoadAdaptiveMinuteWindow:
+    """Track request count and token count over the last ``window_seconds`` (default 60s)."""
+
+    __slots__ = ("_window", "_lock", "_events")
+
+    def __init__(self, window_seconds: float = 60.0):
+        self._window = float(window_seconds)
+        self._lock = threading.Lock()
+        self._events: Deque[Tuple[float, int, int]] = deque()
+
+    @property
+    def window_seconds(self) -> float:
+        return self._window
+
+    def record_request(self, input_tokens: int) -> None:
+        now = time.time()
+        tok = max(0, int(input_tokens))
+        with self._lock:
+            self._events.append((now, 1, tok))
+            self._prune_locked(now)
+
+    def _prune_locked(self, now: float) -> None:
+        cutoff = now - self._window
+        while self._events and self._events[0][0] < cutoff:
+            self._events.popleft()
+
+    def counts_in_window(self) -> Tuple[int, int]:
+        """Return ``(request_count, total_input_tokens)`` in the current window."""
+        now = time.time()
+        with self._lock:
+            self._prune_locked(now)
+            req_total = 0
+            tok_total = 0
+            for _, r, t in self._events:
+                req_total += r
+                tok_total += t
+            return req_total, tok_total
+
+
+class LoadAdaptiveContextController:
+    """Minute load counters + compare adjacent minutes (2× / ½×) to adjust ``context_cache_overall_factor``."""
+
+    __slots__ = ("_cache", "_window", "_ctrl_lock", "_eval_anchor", "_prev_req", "_prev_tok")
+
+    def __init__(self, cache: Any, window_seconds: float = 60.0):
+        self._cache = cache
+        self._window = LoadAdaptiveMinuteWindow(window_seconds)
+        self._ctrl_lock = threading.Lock()
+        self._eval_anchor = time.time()
+        self._prev_req = 0
+        self._prev_tok = 0
+
+    def record_request(self, input_tokens: int) -> None:
+        self._window.record_request(input_tokens)
+        with self._ctrl_lock:
+            now = time.time()
+            if now - self._eval_anchor < self._window.window_seconds:
+                return
+            curr_req, curr_tok = self._window.counts_in_window()
+            prev_req, prev_tok = self._prev_req, self._prev_tok
+            self._maybe_resize_context_window(prev_req, prev_tok, curr_req, curr_tok)
+            self._prev_req, self._prev_tok = curr_req, curr_tok
+            self._eval_anchor = now
+
+    def minute_counts(self) -> Tuple[int, int]:
+        return self._window.counts_in_window()
+
+    def _maybe_resize_context_window(
+        self,
+        prev_req: int,
+        prev_tok: int,
+        curr_req: int,
+        curr_tok: int,
+    ) -> None:
+        cfg = self._cache.config
+        n = int(cfg.context_cache_window_len)
+        if n < 1:
+            return
+        w_max = int(cfg.context_cache_window_max)
+        w = cfg.effective_context_window_len(None)
+        ratio = float(cfg.load_adaptive_ratio)
+        high_load = False
+        low_load = False
+        if prev_req > 0:
+            if curr_req >= ratio * prev_req:
+                high_load = True
+            elif curr_req <= prev_req / ratio:
+                low_load = True
+        if prev_tok > 0:
+            if curr_tok >= ratio * prev_tok:
+                high_load = True
+            elif curr_tok <= prev_tok / ratio:
+                low_load = True
+
+        if high_load and low_load:
+            return
+        if high_load:
+            new_w = max(1, w - 1)
+            if new_w != w:
+                cfg.context_cache_overall_factor = new_w / float(n)
+                _logger.info(
+                    "load_adaptive: load >= %.3g× previous minute (req %s→%s, tok %s→%s); "
+                    "effective window %s → %s (overall_factor=%.6g)",
+                    ratio,
+                    prev_req,
+                    curr_req,
+                    prev_tok,
+                    curr_tok,
+                    w,
+                    new_w,
+                    cfg.context_cache_overall_factor,
+                )
+            return
+        if low_load:
+            new_w = min(w_max, w + 1)
+            if new_w != w:
+                cfg.context_cache_overall_factor = new_w / float(n)
+                _logger.info(
+                    "load_adaptive: load <= 1/%.3g× previous minute (req %s→%s, tok %s→%s); "
+                    "effective window %s → %s (overall_factor=%.6g)",
+                    ratio,
+                    prev_req,
+                    curr_req,
+                    prev_tok,
+                    curr_tok,
+                    w,
+                    new_w,
+                    cfg.context_cache_overall_factor,
+                )

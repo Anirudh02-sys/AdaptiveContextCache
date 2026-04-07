@@ -171,6 +171,16 @@ class ChatCompletion(openai.ChatCompletion, BaseCacheLLM):
         enable_token_counter = chat_cache.config.enable_token_counter
         cache_mode = kwargs.pop("cache_mode", "contextcache")
 
+        if chat_cache.config.load_adaptive:
+            msgs = kwargs.get("messages") or []
+            try:
+                n_input_tok = (
+                    _num_tokens_from_messages(msgs) if msgs else 0
+                )
+            except (TypeError, AttributeError, KeyError, ValueError):
+                n_input_tok = 0
+            chat_cache.record_load_adaptive_request(n_input_tok)
+
         def cache_data_convert(cache_data):
             if enable_token_counter:
                 input_token = _num_tokens_from_messages(kwargs.get("messages"))
@@ -196,7 +206,7 @@ class ChatCompletion(openai.ChatCompletion, BaseCacheLLM):
             return ans, is_hit, retrival_id_query, retrival_id_context
         if cache_mode == "no-cache":
             kwargs["cache_skip"] = True
-        if cache_mode not in ("contextcache", "no-cache"):
+        if cache_mode not in ("contextcache", "adaptivecontextcache", "no-cache"):
             raise ValueError(f"unsupported cache_mode: {cache_mode}")
         ans, is_hit, retrival_id_query, retrival_id_context = adapt(
             cls._llm_handler,

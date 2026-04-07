@@ -211,6 +211,38 @@ def _token_f1(pred: str, gold: str) -> float:
     return (2 * precision * recall) / (precision + recall)
 
 
+def _accuracy_baseline_key(
+    app_id: int, thread_idx: int, conversation_id: str, turn_index: int
+) -> Tuple[int, int, str, int]:
+    return (int(app_id), int(thread_idx), str(conversation_id), int(turn_index))
+
+
+def _load_accuracy_baseline_from_log(path: str) -> Dict[Tuple[int, int, str, int], str]:
+    """Map (application_id, thread_id, conversation_id, turn_index) -> response text from a prior run."""
+    out: Dict[Tuple[int, int, str, int], str] = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            key = _accuracy_baseline_key(
+                int(row["application_id"]),
+                int(row["thread_id"]),
+                str(row["conversation_id"]),
+                int(row["turn_index"]),
+            )
+            text = row.get("response_text")
+            if text is None:
+                text = row.get("response_snippet", "")
+            out[key] = str(text) if text is not None else ""
+    return out
+
+
+def _perfect_accuracy_metrics() -> Dict[str, float]:
+    return {"exact_match": 1.0, "token_f1": 1.0, "sequence_ratio": 1.0}
+
+
 def _accuracy_metrics(predicted: str, expected: str) -> Dict[str, float]:
     p = predicted or ""
     e = expected or ""
@@ -426,6 +458,7 @@ def _thread_worker(
                     }
                 ],
                 "temperature": 0,
+                "max_tokens": 10,
             }
 
             ok = False
@@ -462,14 +495,20 @@ def _thread_worker(
                     time.sleep(backoff)
 
             accuracy = None
-            if (
-                ok
-                and not is_placeholder_response
-                and accuracy_enabled
-                and isinstance(expected_answer, str)
-                and expected_answer.strip()
-            ):
-                accuracy = _accuracy_metrics(response_text, expected_answer)
+            if ok and not is_placeholder_response and accuracy_enabled:
+                if bool(config.get("accuracy_baseline_reference_run", False)):
+                    accuracy = _perfect_accuracy_metrics()
+                else:
+                    baseline_map = config.get("_accuracy_baseline_map")
+                    if baseline_map is not None:
+                        bkey = _accuracy_baseline_key(
+                            app_id, thread_idx, conversation_id, turn_idx
+                        )
+                        gold = baseline_map.get(bkey, "")
+                        if isinstance(gold, str) and gold.strip():
+                            accuracy = _accuracy_metrics(response_text, gold)
+                    elif isinstance(expected_answer, str) and expected_answer.strip():
+                        accuracy = _accuracy_metrics(response_text, expected_answer)
 
             state.add_result(
                 app_id=app_id,
@@ -500,6 +539,7 @@ def _thread_worker(
                     "request_prompt": user_prompt,
                     "expected_response": expected_answer[:240] if isinstance(expected_answer, str) else "",
                     "response_snippet": used_answer[:240],
+                    "response_text": used_answer,
                     "request_content_count": len(content_list),
                 }
                 if accuracy:
@@ -586,6 +626,7 @@ def _run_warmup_conversation(
                 }
             ],
             "temperature": 0,
+            "max_tokens": 10,
         }
 
         ok = False
@@ -670,6 +711,7 @@ def _run_warmup_phase(
     warmup_log_path: str,
 ) -> Dict[str, Any]:
     if not warmup_records:
+        print("[warmup] no conversations to run; skipping warmup phase.", flush=True)
         return {
             "entry_type": "warmup_summary",
             "conversations_seen": 0,
@@ -697,7 +739,16 @@ def _run_warmup_phase(
     cache_hit_count = 0
     cache_miss_count = 0
 
-    for conversation in warmup_records:
+    n_warmup = len(warmup_records)
+    # Frequent lines for small runs; ~10 milestones for large runs.
+    progress_step = max(1, n_warmup // 10)
+    print(
+        f"[warmup] sending requests for {n_warmup} conversation(s)...",
+        flush=True,
+    )
+
+    for i, conversation in enumerate(warmup_records, start=1):
+        conv_id = conversation.get("conversation_id", "?")
         conv_result = _run_warmup_conversation(
             conversation=conversation,
             config=config,
@@ -711,6 +762,22 @@ def _run_warmup_phase(
         error_count += int(conv_result["errors"])
         cache_hit_count += int(conv_result["cache_hits"])
         cache_miss_count += int(conv_result["cache_misses"])
+
+        if (
+            n_warmup <= 25
+            or i == 1
+            or i == n_warmup
+            or i % progress_step == 0
+        ):
+            elapsed = time.time() - started_at
+            print(
+                f"[warmup] progress {i}/{n_warmup} "
+                f"conversation_id={conv_id!r} "
+                f"(+{conv_result['requests_sent']} req this conv; "
+                f"cumulative req={request_count} ok={success_count} err={error_count}; "
+                f"{elapsed:.1f}s elapsed)",
+                flush=True,
+            )
 
     elapsed_s = max(0.001, time.time() - started_at)
 
@@ -730,6 +797,14 @@ def _run_warmup_phase(
             with open(warmup_log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(summary, ensure_ascii=False) + "\n")
 
+    print(
+        f"[warmup] finished: {request_count} requests, "
+        f"{success_count} success, {error_count} errors, "
+        f"cache_hits={cache_hit_count} cache_misses={cache_miss_count}, "
+        f"{elapsed_s:.1f}s total",
+        flush=True,
+    )
+
     return summary
 
 def run(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -744,9 +819,18 @@ def run(config: Dict[str, Any]) -> Dict[str, Any]:
     warmup_enabled = bool(config.get("warmup_enabled", False))
     if warmup_enabled:
         warmup_records = _load_warmup_records(config)
+        warmup_rel = config.get("warmup_file", "")
+        data_dir = config.get("data_dir", "")
+        warmup_path = os.path.join(str(data_dir), str(warmup_rel)) if warmup_rel else ""
+        print(
+            f"[warmup] loaded {len(warmup_records)} conversation(s)"
+            + (f" from {warmup_path}" if warmup_path else ""),
+            flush=True,
+        )
         warmup_summary = _run_warmup_phase(warmup_records, config, warmup_log_path)
 
     if warmup_summary is not None:
+        print("[warmup] summary (JSON):", flush=True)
         print(json.dumps(warmup_summary, ensure_ascii=False, indent=2))
 
     app_records = _load_app_records(config)
@@ -772,6 +856,16 @@ def run(config: Dict[str, Any]) -> Dict[str, Any]:
         with open(log_path, "w", encoding="utf-8") as f:
             f.write("")
     log_lock = threading.Lock()
+
+    baseline_path = str(config.get("accuracy_baseline_log_path", "")).strip()
+    if baseline_path:
+        if not os.path.isfile(baseline_path):
+            raise FileNotFoundError(
+                f"accuracy_baseline_log_path does not exist: {baseline_path}"
+            )
+        config["_accuracy_baseline_map"] = _load_accuracy_baseline_from_log(baseline_path)
+    else:
+        config["_accuracy_baseline_map"] = None
 
     state = RunState()
     experiment_end_time = (
@@ -894,8 +988,22 @@ def run(config: Dict[str, Any]) -> Dict[str, Any]:
     avg_sequence_ratio = (
         state.accuracy_sequence_ratio_sum / accuracy_count if accuracy_count else 0.0
     )
+    if bool(config.get("accuracy_baseline_reference_run", False)):
+        accuracy_eval_mode = "baseline_reference_run"
+    elif baseline_path:
+        accuracy_eval_mode = "vs_nocache_log"
+    else:
+        accuracy_eval_mode = "vs_dataset"
+
     result = {
         "dry_run": bool(config.get("dry_run", False)),
+        "accuracy_eval": {
+            "mode": accuracy_eval_mode,
+            "baseline_log_path": baseline_path or None,
+            "baseline_reference_run": bool(
+                config.get("accuracy_baseline_reference_run", False)
+            ),
+        },
         "load_multiplier": _safe_float(config.get("load_multiplier", 1.0), default=1.0),
         "experiment_duration_seconds": round(experiment_duration_s, 3),
         "time_limited_run": bool(experiment_end_time is not None),

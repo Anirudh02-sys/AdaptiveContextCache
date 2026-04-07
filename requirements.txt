@@ -1,3 +1,9 @@
-numpy
+# onnxruntime wheels are often built against NumPy 1.x; NumPy 2.x breaks import (e.g. _ARRAY_API).
+numpy>=1.21,<2
+# v5 removed summarization / text2text-generation pipelines used by the context summarizer.
+transformers>=4.30,<5
+# Context summarizer (BART) and transformer models need a PyTorch runtime (CPU wheels on PyPI; use pytorch.org for CUDA).
+torch>=2.0
 cachetools
 requests
+matplotlib

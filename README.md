@@ -106,7 +106,7 @@ If no candidate qualifies:
 
 Notes:
 
-- `requirements.txt` is intentionally minimal (`numpy`, `cachetools`, `requests`).
+- `requirements.txt` is intentionally small (`numpy` pinned to 1.x for `onnxruntime` compatibility, `transformers` pinned to 4.x for summarization pipelines, `torch` for those models, `cachetools`, `requests`).
 - Several optional packages are loaded lazily and can be auto-installed on first use (for example FastAPI/uvicorn/openai/onnxruntime/faiss).
 
 ---
@@ -515,6 +515,43 @@ Key config fields in `Config` (`gptcache/config.py`):
 - `auto_flush` - flush period for cache persistence.
 - `enable_token_counter`, `input_summary_len`, `data_check`, `disable_report`.
 
+### Context window sizing (base × overall × per-app)
+
+ContextCache keeps a fixed **base** window size `context_cache_window_len` (call it \(N\)). The **effective**
+window size used when slicing dialogue-turn embeddings is computed per request:
+
+\[
+W = \mathrm{clamp}_{[1,\,W_{\max}]}\Big(\mathrm{round}\big(N \cdot f_{\text{overall}} \cdot f_{\text{app}}\big)\Big)
+\]
+
+Where:
+
+- **Base** \(N\): `context_cache_window_len` (set by server flag `--context-cache-window-len` / YAML config).
+- **Overall factor** \(f_{\text{overall}}\): `context_cache_overall_factor` (starts at `1.0`).
+  - When `load_adaptive` is enabled, the load controller periodically updates this **factor** (not `N`) so the
+    effective window moves by \(\pm 1\) within `context_cache_window_max`.
+- **Per-app factor** \(f_{\text{app}}\): `context_cache_window_factor_by_app[application_id]` (defaults to `1.0` if missing).
+  - The map starts empty. When present, it lets different applications use different context window sizes
+    while sharing the same base \(N\) and overall factor.
+
+#### SLO-driven per-app factors (server hook)
+
+When you register/deregister applications via `POST /v1/applications` / `DELETE /v1/applications/{id}`, the server
+calls `on_application_registry_changed()` (`gptcache_server/server.py`) which recomputes
+`context_cache_window_factor_by_app` from the registered **SLO targets**:
+
+- **Latency strictness**: lower `latency_p99_ms` ⇒ stricter (uses `1/latency_p99_ms`)
+- **Accuracy strictness**: higher `accuracy_slo` ⇒ stricter
+
+Algorithm (low-latency, \(O(n)\) over registered apps):
+
+- Min-max normalize `1/latency_p99_ms` and `accuracy_slo` to \([0,1]\) (missing values contribute 0).
+- Strictness score per app:
+  - `strict = 0.7 * norm_latency + 0.3 * norm_accuracy`
+- Convert strictness to a multiplier via z-score and clipping:
+  - `f_app = clip(1 + 0.6 * zscore(strict), 0.5, 2.0)`
+- Renormalize multipliers so the **geometric mean is ~1.0** (keeps factors relative and avoids globally inflating/shrinking all windows).
+
 Server CLI flags (`gptcache_server/server.py`):
 
 - `-s, --host`
@@ -648,60 +685,4 @@ env -u APPIMAGE /usr/bin/python3 -m gptcache_server.server -s 127.0.0.1 -p 8012 
 ```
 
 Note: `/flush` persists cache to storage; it does not delete entries.
-
-### OpenAI error mentions `Cursor-...AppImage` path
-
-Symptom example:
-
-`openai error: [Errno 2] No such file or directory: '/.../Cursor-2.4.37-x86_64.AppImage'`
-
-Cause:
-
-- In some Cursor-launched shells, `APPIMAGE` can make Python report an invalid `sys.executable`.
-- OpenAI Python SDK (`0.28.x`) reads platform metadata and fails when that executable path does not exist.
-
-Checks:
-
-```bash
-env | grep -E "APPIMAGE|SSL_CERT_FILE|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE|OPENAI_API_URL|OPENAI_API_BASE|HTTPS_PROXY|HTTP_PROXY"
-python3 -c 'import sys; print(sys.executable)'
-```
-
-Workaround for run commands:
-
-```bash
-env -u APPIMAGE /usr/bin/python3 -m gptcache_server.server -s 127.0.0.1 -p 8012 -d /tmp/contextcache_data -o True
-```
-
-Optional shell-level mitigation:
-
-```bash
-unset APPIMAGE
-```
-
-### Dependency errors
-
-- Run `python3 -m pip install -e .` first.
-- If optional modules still fail, install explicitly (for example `fastapi`, `uvicorn`, `openai`, `onnxruntime`, `faiss-cpu`).
-
----
-
-## Known limitations of this branch
-
-- `ContextMatchEvaluation` in `gptcache/similarity_evaluation/context_match.py` contains a hardcoded local checkpoint path (`/data/home/.../checkpoint_epoch_20.pth`). It will fail unless you provide/edit that model path.
-- There are multiple pathways (sync/async, API/server/OpenAI) inherited from GPTCache plus custom branch logic; behavior may differ by entrypoint.
-
----
-
-## License / upstream note
-
-This repository is based on GPTCache-style architecture (`setup.py` still references GPTCache metadata). Treat this branch as a customized ContextCache variant and validate behavior in your target deployment path.
-
-**Performance note:**  
-When using ContextCache, you'll notice a significant latency difference between cache **hits** and **misses**:  
-- **Cache hit:** ~0.2 seconds per response  
-- **Cache miss:** ~1.4 seconds per response  
-
-This is expected, as cache misses require a fresh model completion, while hits retrieve results instantly from the cache.
-
 

@@ -1,6 +1,6 @@
 import atexit
 import os
-from typing import Optional, List, Any
+from typing import Any, List, Optional, Tuple
 import numpy as np
 
 from gptcache.config import Config
@@ -14,6 +14,7 @@ from gptcache.similarity_evaluation import ExactMatchEvaluation
 from gptcache.similarity_evaluation import SimilarityEvaluation
 from gptcache.utils import import_openai
 from gptcache.utils.cache_func import cache_all
+from gptcache.utils.adaptive_window import LoadAdaptiveContextController
 from gptcache.utils.log import gptcache_log
 from gptcache.processor.context.summarization_context import (
     SummarizationContextProcess,
@@ -45,6 +46,7 @@ class Cache:
         self.config = Config()
         self.report = Report()
         self.next_cache = None
+        self._load_adaptive_controller: Optional[LoadAdaptiveContextController] = None
 
     def init(
         self,
@@ -82,6 +84,8 @@ class Cache:
         self.config = config
         self.next_cache = next_cache
         self.input_summarizer = SummarizationContextProcess()
+        if config.load_adaptive:
+            self._load_adaptive_controller = LoadAdaptiveContextController(self)
 
         @atexit.register
         def close():
@@ -90,6 +94,22 @@ class Cache:
             except Exception as e:  # pylint: disable=W0703
                 if not os.getenv("IS_CI"):
                     gptcache_log.error(e)
+
+    def record_load_adaptive_request(self, input_tokens: int) -> None:
+        """Count one incoming request and its estimated input tokens when load_adaptive is on."""
+        if not self.config.load_adaptive:
+            return
+        if self._load_adaptive_controller is None:
+            self._load_adaptive_controller = LoadAdaptiveContextController(self)
+        self._load_adaptive_controller.record_request(input_tokens)
+
+    def load_adaptive_minute_stats(self) -> Optional[Tuple[int, int]]:
+        """Return ``(requests, tokens)`` in the last minute, or ``None`` if load_adaptive is off."""
+        if not self.config.load_adaptive:
+            return None
+        if self._load_adaptive_controller is None:
+            return 0, 0
+        return self._load_adaptive_controller.minute_counts()
 
     def import_data(self, questions: List[Any], answers: List[Any], session_ids: Optional[List[Optional[str]]] = None) -> None:
         """Import data to GPTCache
@@ -135,8 +155,9 @@ class Cache:
                     newquestions.append(q)
                     newanswers.append(answers[i][j])
                     newemb.append(tmp[-1])
-                    if len(tmp) >5:
-                        tmp = tmp[-5:]
+                    _cw = self.config.effective_context_window_len(None)
+                    if len(tmp) > _cw:
+                        tmp = tmp[-_cw:]
                     newcontext.append(np.array(tmp))                
             else:
                 raise ValueError("question type not supported")

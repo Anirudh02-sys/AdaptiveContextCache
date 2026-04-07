@@ -1,10 +1,13 @@
 import argparse
 import json
 import os
+import uuid
 import zipfile
-from typing import Optional
+from threading import Lock
+from typing import Any, Dict, Optional
 
 from gptcache import cache, Cache
+from gptcache.config import Config
 from gptcache.adapter import openai
 from gptcache.adapter.api import (
     get,
@@ -31,10 +34,125 @@ cache_file_key = ""
 server_mode = "contextcache"
 dry_run: bool = False
 
+_application_slos: Dict[str, Dict[str, Any]] = {}
+_application_slos_lock = Lock()
+
+
+def on_application_registry_changed() -> None:
+    """Recompute per-app context-window factors from registered SLO targets.
+
+    Low-latency policy:
+    - O(n) over registered applications
+    - uses only *targets* (latency_p99_ms lower is stricter; accuracy_slo higher is stricter)
+    - assigns multiplicative factors around 1.0 and keeps the geometric mean near 1.0
+    """
+
+    def _safe_float(x: Any) -> Optional[float]:
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return None
+        if v != v:  # NaN
+            return None
+        return v
+
+    # Snapshot quickly under the lock.
+    with _application_slos_lock:
+        items = list(_application_slos.items())
+
+    # If slo_adaptive is off, keep per-app multipliers neutral (1.0).
+    # This makes app-level scaling opt-in via --slo-adaptive / config.slo_adaptive.
+    if not bool(getattr(cache.config, "slo_adaptive", False)):
+        ones = {app_id: 1.0 for app_id, _ in items}
+        cache.config.context_cache_window_factor_by_app = dict(ones)
+        if openai_cache is not None:
+            openai_cache.config.context_cache_window_factor_by_app = dict(ones)
+        return
+
+    # If no apps (or only one), keep factors empty / neutral.
+    if len(items) <= 1:
+        cache.config.context_cache_window_factor_by_app = {}
+        if openai_cache is not None:
+            openai_cache.config.context_cache_window_factor_by_app = {}
+        return
+
+    # Build per-app "strictness" score from SLO targets.
+    # - latency_strict: lower latency target => higher strictness (use inverse latency)
+    # - accuracy_strict: higher accuracy target => higher strictness
+    lat_inv: Dict[str, float] = {}
+    acc: Dict[str, float] = {}
+    for app_id, rec in items:
+        lat = _safe_float((rec or {}).get("latency_p99_ms"))
+        a = _safe_float((rec or {}).get("accuracy_slo"))
+        if lat is not None and lat > 0:
+            lat_inv[app_id] = 1.0 / lat
+        if a is not None:
+            acc[app_id] = a
+
+    # Normalize to [0,1] with min-max; missing signals contribute 0.
+    def _minmax_norm(vals: Dict[str, float]) -> Dict[str, float]:
+        if not vals:
+            return {}
+        vmin = min(vals.values())
+        vmax = max(vals.values())
+        if vmax <= vmin:
+            return {k: 0.5 for k in vals}
+        span = vmax - vmin
+        return {k: (v - vmin) / span for k, v in vals.items()}
+
+    lat_n = _minmax_norm(lat_inv)
+    acc_n = _minmax_norm(acc)
+
+    alpha = 0.7  # weight latency strictness
+    beta = 0.3   # weight accuracy strictness
+    strict: Dict[str, float] = {}
+    for app_id, _ in items:
+        strict[app_id] = alpha * lat_n.get(app_id, 0.0) + beta * acc_n.get(app_id, 0.0)
+
+    # Convert strictness into multiplicative factors. Keep it cheap and bounded.
+    #
+    # Directional policy:
+    # - latency-sensitive apps (tighter latency than accuracy) -> smaller factor (<1)
+    #   to use shorter context windows and favor cache hits.
+    # - accuracy-sensitive apps (tighter accuracy than latency) -> larger factor (>1)
+    #   to use longer context windows and favor contextual precision.
+    #
+    # score in [-1, +1] approximately:
+    #   score = normalized_accuracy_pressure - normalized_latency_pressure
+    gamma = 0.8
+    min_f = 0.6
+    max_f = 2.2
+    factors = {}
+    for app_id, _ in items:
+        score = acc_n.get(app_id, 0.0) - lat_n.get(app_id, 0.0)
+        f = 1.0 + gamma * score
+        if f < min_f:
+            f = min_f
+        elif f > max_f:
+            f = max_f
+        factors[app_id] = float(f)
+
+    # Install factors (only for currently-registered apps).
+    cache.config.context_cache_window_factor_by_app = dict(factors)
+    if openai_cache is not None:
+        openai_cache.config.context_cache_window_factor_by_app = dict(factors)
+
 
 class CacheData(BaseModel):
     prompt: str
     answer: Optional[str] = ""
+    application_id: Optional[str] = None
+
+
+class ApplicationSloIn(BaseModel):
+    """SLO targets for an application (aligned with request_gen application_slo_expectations)."""
+
+    latency_p99_ms: float
+    accuracy_slo: float
+
+
+class ApplicationSloOut(BaseModel):
+    application_id: str
 
 
 def last_content_query_only(data, **kwargs):
@@ -57,13 +175,57 @@ async def put_cache(cache_data: CacheData) -> str:
 @app.post("/get")
 async def get_cache(cache_data: CacheData) -> CacheData:
     result = get(cache_data.prompt)
-    return CacheData(prompt=cache_data.prompt, answer=result)
+    return CacheData(
+        prompt=cache_data.prompt,
+        answer=result,
+        application_id=cache_data.application_id,
+    )
 
 
 @app.post("/flush")
 async def flush_cache() -> str:
     cache.flush()
     return "successfully flush the cache"
+
+
+@app.post("/v1/applications", response_model=ApplicationSloOut)
+async def register_application_slo(body: ApplicationSloIn) -> ApplicationSloOut:
+    """Register latency and accuracy SLOs; returns a server-issued application id."""
+    if body.latency_p99_ms <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="latency_p99_ms must be positive",
+        )
+    if not 0.0 <= body.accuracy_slo <= 1.0:
+        raise HTTPException(
+            status_code=400,
+            detail="accuracy_slo must be between 0.0 and 1.0",
+        )
+    app_id = str(uuid.uuid4())
+    record = {
+        "latency_p99_ms": body.latency_p99_ms,
+        "accuracy_slo": body.accuracy_slo,
+    }
+    with _application_slos_lock:
+        _application_slos[app_id] = record
+    on_application_registry_changed()
+    return ApplicationSloOut(application_id=app_id)
+
+
+@app.delete("/v1/applications/{application_id}")
+async def deregister_application(application_id: str) -> dict:
+    """Remove a previously registered application (SLO record) by id."""
+    aid = (application_id or "").strip()
+    if not aid:
+        raise HTTPException(status_code=400, detail="application_id is required")
+    with _application_slos_lock:
+        if aid not in _application_slos:
+            raise HTTPException(
+                status_code=404, detail="unknown application_id"
+            )
+        del _application_slos[aid]
+    on_application_registry_changed()
+    return {"ok": True}
 
 
 @app.get("/cache_file")
@@ -188,9 +350,32 @@ def main():
     parser.add_argument(
         "-m",
         "--server-mode",
-        choices=["no-cache", "gptcache", "contextcache"],
+        choices=["no-cache", "gptcache", "contextcache", "adaptivecontextcache"],
         default="contextcache",
-        help="chat proxy cache mode: no-cache, gptcache, or contextcache",
+        help=(
+            "chat proxy cache mode: no-cache, gptcache, contextcache, or "
+            "adaptivecontextcache (same as contextcache for now; use --load-adaptive / --slo-adaptive for future behavior)."
+        ),
+    )
+    parser.add_argument(
+        "--load-adaptive",
+        action="store_true",
+        help="enable load-adaptive minute counters and context-window scaling.",
+    )
+    parser.add_argument(
+        "--load-adaptive-ratio",
+        type=float,
+        default=2.0,
+        metavar="R",
+        help=(
+            "multiplicative load factor R>1 vs previous minute: shrink when load >= R×; "
+            "grow when load <= 1/R× (default: 2.0)."
+        ),
+    )
+    parser.add_argument(
+        "--slo-adaptive",
+        action="store_true",
+        help="enable SLO-adaptive aspect (adaptivecontextcache; no-op until implemented).",
     )
     parser.add_argument(
         "-dr",
@@ -199,8 +384,20 @@ def main():
         default="no",
         help="whether to run in dry-run mode",
     )
-
+    parser.add_argument(
+        "-cw",
+        "--context-cache-window-len",
+        type=int,
+        default=5,
+        metavar="N",
+        help=(
+            "max dialogue embeddings kept for contextcache matching (default: 5). "
+            "Applies after YAML init too (overrides config.context_cache_window_len from -f)."
+        ),
+    )
     args = parser.parse_args()
+    if args.load_adaptive_ratio <= 1.0:
+        parser.error("--load-adaptive-ratio must be > 1.0")
     global cache_dir
     global cache_file_key
     global server_mode
@@ -210,8 +407,20 @@ def main():
         init_conf = init_similar_cache_from_config(config_dir=args.cache_config_file)
         cache_dir = init_conf.get("storage_config", {}).get("data_dir", "")
     else:
-        init_similar_cache(args.cache_dir)
+        init_similar_cache(
+            args.cache_dir,
+            config=Config(
+                context_cache_window_len=args.context_cache_window_len,
+                load_adaptive=args.load_adaptive,
+                load_adaptive_ratio=args.load_adaptive_ratio,
+                slo_adaptive=args.slo_adaptive,
+            ),
+        )
         cache_dir = args.cache_dir
+    cache.config.context_cache_window_len = args.context_cache_window_len
+    cache.config.load_adaptive = args.load_adaptive
+    cache.config.load_adaptive_ratio = args.load_adaptive_ratio
+    cache.config.slo_adaptive = args.slo_adaptive
     cache_file_key = args.cache_file_key
     server_mode = args.server_mode
     dry_run = args.dry_run == "yes"
@@ -231,7 +440,17 @@ def main():
                 data_dir=openai_cache_dir,
                 pre_func=pre_func,
                 cache_obj=openai_cache,
+                config=Config(
+                    context_cache_window_len=args.context_cache_window_len,
+                    load_adaptive=args.load_adaptive,
+                    load_adaptive_ratio=args.load_adaptive_ratio,
+                    slo_adaptive=args.slo_adaptive,
+                ),
             )
+        openai_cache.config.context_cache_window_len = args.context_cache_window_len
+        openai_cache.config.load_adaptive = args.load_adaptive
+        openai_cache.config.load_adaptive_ratio = args.load_adaptive_ratio
+        openai_cache.config.slo_adaptive = args.slo_adaptive
 
         import_starlette()
         from starlette.middleware.cors import CORSMiddleware

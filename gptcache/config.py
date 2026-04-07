@@ -1,4 +1,4 @@
-from typing import Optional, Callable, List
+from typing import Callable, Dict, List, Optional
 
 from gptcache.utils.error import CacheError
 
@@ -25,6 +25,20 @@ class Config:
     :type skip_list: Optional[List[str]]
     :param context_len: optional, the length of context.
     :type context_len: Optional[int]
+    :param context_cache_window_len: base default window N (fixed); effective length is ``round(N * overall_factor * app_factor)`` clamped to ``[1, context_cache_window_max]``.
+    :type context_cache_window_len: int
+    :param context_cache_overall_factor: load-adaptive multiplicative factor on the base default (starts at 1.0; adjusted by load controller).
+    :type context_cache_overall_factor: float
+    :param context_cache_window_factor_by_app: application_id -> per-app multiplier; missing ids use factor 1.0. Starts empty.
+    :type context_cache_window_factor_by_app: Optional[Dict[str, float]]
+    :param context_cache_window_max: upper cap on the effective window length.
+    :type context_cache_window_max: int
+    :param load_adaptive: adaptivecontextcache: load-aware adaptation (minute counters + optional context window scaling).
+    :type load_adaptive: bool
+    :param load_adaptive_ratio: R > 1: shrink window when load >= R× previous minute; grow when load <= previous/R.
+    :type load_adaptive_ratio: float
+    :param slo_adaptive: adaptivecontextcache: SLO-aware adaptation (reserved; currently no-op).
+    :type slo_adaptive: bool
 
     Example:
         .. code-block:: python
@@ -51,6 +65,13 @@ class Config:
             method: str = "mean", # or "attention",
             model_name: str = "qwq",
             cache_mode: str = "context",  # context | plain | none
+            context_cache_window_len: int = 5,
+            context_cache_overall_factor: float = 1.0,
+            context_cache_window_factor_by_app: Optional[Dict[str, float]] = None,
+            context_cache_window_max: int = 32,
+            load_adaptive: bool = False,
+            load_adaptive_ratio: float = 2.0,
+            slo_adaptive: bool = False,
     ):
         if similarity_threshold < 0 or similarity_threshold > 1:
             raise CacheError(
@@ -59,6 +80,45 @@ class Config:
         if cache_mode not in ("context", "plain", "none"):
             raise CacheError(
                 "Invalid cache_mode, expected one of: context, plain, none"
+            )
+        if context_cache_window_len < 1:
+            raise CacheError(
+                "Invalid context_cache_window_len, expected integer >= 1"
+            )
+        if context_cache_window_max < 1:
+            raise CacheError(
+                "Invalid context_cache_window_max, expected integer >= 1"
+            )
+        if context_cache_window_max < context_cache_window_len:
+            raise CacheError(
+                "context_cache_window_max must be >= context_cache_window_len"
+            )
+        if context_cache_overall_factor <= 0:
+            raise CacheError(
+                "context_cache_overall_factor must be > 0"
+            )
+        _by_app_f: Dict[str, float] = {}
+        if context_cache_window_factor_by_app:
+            for key, val in context_cache_window_factor_by_app.items():
+                sk = str(key).strip()
+                if not sk:
+                    raise CacheError(
+                        "context_cache_window_factor_by_app keys must be non-empty strings"
+                    )
+                try:
+                    fv = float(val)
+                except (TypeError, ValueError) as e:
+                    raise CacheError(
+                        "context_cache_window_factor_by_app values must be numbers"
+                    ) from e
+                if fv <= 0:
+                    raise CacheError(
+                        "context_cache_window_factor_by_app values must be > 0"
+                    )
+                _by_app_f[sk] = fv
+        if load_adaptive_ratio <= 1.0:
+            raise CacheError(
+                "load_adaptive_ratio must be > 1.0"
             )
         self.log_time_func = log_time_func
         self.similarity_threshold = similarity_threshold
@@ -79,8 +139,35 @@ class Config:
         self.method = method
         self.model_name = model_name
         self.cache_mode = cache_mode
+        self.context_cache_window_len = context_cache_window_len
+        self.context_cache_overall_factor = float(context_cache_overall_factor)
+        self.context_cache_window_factor_by_app = _by_app_f
+        self.context_cache_window_max = context_cache_window_max
+        self.load_adaptive = load_adaptive
+        self.load_adaptive_ratio = float(load_adaptive_ratio)
+        self.slo_adaptive = slo_adaptive
         self.context_emb = None
         self.cur_id = 0
         self.set_use_api = False
         self.context_q = []
         self.context_a = []
+
+    def effective_context_window_len(self, application_id: Optional[str] = None) -> int:
+        """Effective window: ``round(N * overall_factor * app_factor)`` in ``[1, max]``."""
+        n = int(self.context_cache_window_len)
+        overall = float(self.context_cache_overall_factor)
+        app_f = 1.0
+        if application_id is not None:
+            aid = str(application_id).strip()
+            if aid and aid in self.context_cache_window_factor_by_app:
+                try:
+                    app_f = float(self.context_cache_window_factor_by_app[aid])
+                except (TypeError, ValueError):
+                    app_f = 1.0
+        if overall <= 0:
+            overall = 1.0
+        if app_f <= 0:
+            app_f = 1.0
+        w = int(round(n * overall * app_f))
+        w_max = int(self.context_cache_window_max)
+        return max(1, min(w, w_max))

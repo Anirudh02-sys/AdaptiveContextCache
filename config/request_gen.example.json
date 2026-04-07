@@ -3,7 +3,7 @@
   "endpoint": "/v1/chat/completions",
   "model": "@azure-1/gpt-4o",
   "api_key_env": "VOCAREUM_API_KEY",
-  "data_dir": "data/",
+  "data_dir": "data/min_turns_10_eval_1000_apps",
   "file_glob": "application_*.jsonl",
   "warmup_file": "min_turns_10_warmup_2220.jsonl",
   "warmup_enabled": true,
@@ -35,7 +35,7 @@
   },
   "default_delay_ms": 650,
   "load_multiplier": 1,
-  "experiment_duration_seconds": 60,
+  "experiment_duration_seconds": 600,
   "app_delay_ms": {
     "0": 320,
     "1": 900,
