@@ -1,6 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if ! command -v jq >/dev/null 2>&1; then
+  echo "error: jq is required (this script patches JSON configs). Install it, e.g.:" >&2
+  echo "  Debian/Ubuntu: sudo apt-get install -y jq" >&2
+  echo "  See INSTALL.md (system prerequisites)." >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
+# Prefer repo venv so numpy / gptcache match INSTALL.md (avoid bare /usr/bin/python3).
+if [[ -n "${PYTHON:-}" ]]; then
+  PYTHON_BIN="${PYTHON}"
+elif [[ -x "${REPO_ROOT}/.venv/bin/python" ]]; then
+  PYTHON_BIN="${REPO_ROOT}/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python3)"
+else
+  echo "error: python3 not found. Install Python or set PYTHON to your venv interpreter." >&2
+  exit 1
+fi
+
+if ! env -u APPIMAGE "${PYTHON_BIN}" -c "import numpy, gptcache" >/dev/null 2>&1; then
+  echo "error: ${PYTHON_BIN} cannot import numpy and gptcache." >&2
+  echo "  From the repo root, create a venv and install the package (see INSTALL.md sections 3–4), e.g.:" >&2
+  echo "    python3 -m venv .venv && . .venv/bin/activate" >&2
+  echo "    python -m pip install -r requirements.txt && python -m pip install -e ." >&2
+  echo "  Or set PYTHON=/path/to/a/venv/bin/python that already has those installed." >&2
+  exit 1
+fi
+
 # Orchestrate three experiments against gptcache_server:
 # 1) no-cache
 # 2) gptcache
@@ -9,6 +41,8 @@ set -euo pipefail
 # Usage:
 #   DRY_RUN=yes ./scripts/run_experiments.sh
 #   DRY_RUN=no  ./scripts/run_experiments.sh
+#
+# Uses .venv/bin/python when present, else python3 on PATH. Override with PYTHON=...
 #
 # DRY_RUN controls the server's upstream dry-run flag (--dry-run yes).
 
@@ -39,7 +73,7 @@ mkdir -p "${METRICS_BASE_DIR}"
 mkdir -p "${PLOTS_BASE_DIR}"
 
 server_cmd_base=(
-  env -u APPIMAGE /usr/bin/python3 -m gptcache_server.server
+  env -u APPIMAGE "${PYTHON_BIN}" -m gptcache_server.server
   -s 127.0.0.1
   -p 8012
   -d "${CACHE_DIR}"
@@ -115,7 +149,7 @@ run_experiment() {
 
   wait_for_server
 
-  python3 scripts/generate_requests.py --config "${tmp_config}"
+  "${PYTHON_BIN}" scripts/generate_requests.py --config "${tmp_config}"
 
   kill "${server_pid}" >/dev/null 2>&1 || true
   wait "${server_pid}" 2>/dev/null || true
@@ -126,7 +160,7 @@ run_experiment() {
   local plots_dir="${PLOTS_BASE_DIR}/${suffix}"
   mkdir -p "${plots_dir}"
 
-  python3 scripts/plot_request_metrics.py \
+  "${PYTHON_BIN}" scripts/plot_request_metrics.py \
     --metrics "${metrics_path}" \
     --output-dir "${plots_dir}" \
     --prefix "${suffix}"
@@ -145,7 +179,7 @@ run_experiment "contextcache" "contextcache"
 compare_output_dir="${PLOTS_BASE_DIR}/compare"
 mkdir -p "${compare_output_dir}"
 
-python3 scripts/compare_experiments.py \
+"${PYTHON_BIN}" scripts/compare_experiments.py \
   --metrics-nocache "${METRICS_BASE_DIR}/request_metrics_nocache.json" \
   --metrics-gptcache "${METRICS_BASE_DIR}/request_metrics_gptcache.json" \
   --metrics-contextcache "${METRICS_BASE_DIR}/request_metrics_contextcache.json" \
@@ -155,7 +189,7 @@ python3 scripts/compare_experiments.py \
 # Presentation figures: per-application SLOs + request generation stats.
 SLO_WORKLOAD_DIR="${PLOTS_BASE_DIR}/slo_workload"
 mkdir -p "${SLO_WORKLOAD_DIR}"
-python3 scripts/visualize_app_slos_and_workload.py \
+"${PYTHON_BIN}" scripts/visualize_app_slos_and_workload.py \
   --config "${EXAMPLE_CONFIG}" \
   --output-dir "${SLO_WORKLOAD_DIR}" \
   --prefix "request_gen_example"

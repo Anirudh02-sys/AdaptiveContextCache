@@ -3,21 +3,16 @@
   "endpoint": "/v1/chat/completions",
   "model": "@azure-1/gpt-4o",
   "api_key_env": "VOCAREUM_API_KEY",
-  "data_dir": "data/min_turns_10_eval_1000_apps",
+  "data_dir": "data/mt10_50_5_apps",
   "file_glob": "application_*.jsonl",
-  "warmup_file": "min_turns_10_warmup_2220.jsonl",
+  "warmup_file": "mt10_warmup_50.jsonl",
   "warmup_enabled": true,
   "applications": [
     0,
     1,
     2,
     3,
-    4,
-    5,
-    6,
-    7,
-    8,
-    9
+    4
   ],
   "dry_run": false,
   "default_threads_per_app": 1,
@@ -26,12 +21,7 @@
     "1": 1,
     "2": 1,
     "3": 2,
-    "4": 1,
-    "5": 1,
-    "6": 2,
-    "7": 1,
-    "8": 1,
-    "9": 2
+    "4": 1
   },
   "default_delay_ms": 650,
   "load_multiplier": 1,
@@ -41,12 +31,7 @@
     "1": 900,
     "2": 560,
     "3": 280,
-    "4": 760,
-    "5": 1020,
-    "6": 400,
-    "7": 680,
-    "8": 1180,
-    "9": 460
+    "4": 760
   },
   "application_slo_expectations": {
     "0": {
@@ -68,26 +53,6 @@
     "4": {
       "latency_p99_ms": 21000,
       "accuracy_slo": 0.08
-    },
-    "5": {
-      "latency_p99_ms": 23000,
-      "accuracy_slo": 0.1
-    },
-    "6": {
-      "latency_p99_ms": 19000,
-      "accuracy_slo": 0.06
-    },
-    "7": {
-      "latency_p99_ms": 21000,
-      "accuracy_slo": 0.08
-    },
-    "8": {
-      "latency_p99_ms": 24000,
-      "accuracy_slo": 0.12
-    },
-    "9": {
-      "latency_p99_ms": 19000,
-      "accuracy_slo": 0.06
     }
   },
   "thread_jitter_ms": 90,

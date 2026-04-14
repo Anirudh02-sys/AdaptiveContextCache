@@ -16,7 +16,7 @@ and scripts.
 1) System prerequisites (Ubuntu/Debian)
 ---------------------------------------
 
-Install Python + build tooling:
+Install Python, build tooling, and `jq` (used by `scripts/run_experiments.sh` to edit JSON configs):
 
 ```bash
 sudo apt-get update
@@ -27,7 +27,8 @@ sudo apt-get install -y \
   python3-dev \
   build-essential \
   git \
-  curl
+  curl \
+  jq
 ```
 
 2) Get the source code
@@ -92,5 +93,11 @@ Health check:
 ```bash
 curl -s http://127.0.0.1:8011/
 ```
+
+6) Download dataset
+--------------------------------------------------
+
+Download the dataset from https://drive.google.com/drive/u/1/folders/10Oo-17nqrvMcHVdhUfLaMV_DI5yOkb2a and place it inside the AdaptiveContextCache folder.
+
 
 
