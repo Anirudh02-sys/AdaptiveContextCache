@@ -37,6 +37,7 @@ fi
 # 1) no-cache
 # 2) gptcache
 # 3) contextcache
+# 4) adaptivecontextcache with --slo-adaptive
 #
 # Usage:
 #   DRY_RUN=yes ./scripts/run_experiments.sh
@@ -103,10 +104,15 @@ wait_for_server() {
 }
 
 run_experiment() {
-  local mode="$1"         # no-cache | gptcache | contextcache
-  local suffix="$2"       # nocache | gptcache | contextcache
+  local mode="$1"         # no-cache | gptcache | contextcache | adaptivecontextcache
+  local suffix="$2"       # nocache | gptcache | contextcache | adaptive_slo | ...
+  shift 2
+  local extra_server_args=("$@")   # e.g. --slo-adaptive
 
   echo "=== Running experiment: mode=${mode}, suffix=${suffix}, DRY_RUN=${DRY_RUN} ==="
+  if ((${#extra_server_args[@]} > 0)); then
+    echo "    extra server args: ${extra_server_args[*]}"
+  fi
 
   rm -rf "${CACHE_DIR}"
   mkdir -p "${CACHE_DIR}"
@@ -141,7 +147,7 @@ run_experiment() {
       "${EXAMPLE_CONFIG}" > "${tmp_config}"
   fi
 
-  local server_cmd=("${server_cmd_base[@]}" "--server-mode" "${mode}")
+  local server_cmd=("${server_cmd_base[@]}" "--server-mode" "${mode}" "${extra_server_args[@]}")
   "${server_cmd[@]}" &
   local server_pid=$!
 
@@ -172,16 +178,21 @@ run_experiment() {
   echo
 }
 
-run_experiment "no-cache" "nocache"
-run_experiment "gptcache" "gptcache"
-run_experiment "contextcache" "contextcache"
+# Baseline experiments (uncomment when you want to regenerate nocache / gptcache / contextcache metrics):
+# run_experiment "no-cache" "nocache"
+# run_experiment "gptcache" "gptcache"
+# run_experiment "contextcache" "contextcache"
+
+# SLO-adaptive context cache: adaptivecontextcache + --slo-adaptive (see gptcache_server --help).
+run_experiment "adaptivecontextcache" "adaptive_slo" --slo-adaptive
 
 compare_output_dir="${PLOTS_BASE_DIR}/compare"
 mkdir -p "${compare_output_dir}"
 
 "${PYTHON_BIN}" scripts/compare_experiments.py \
-  --metrics-nocache "${METRICS_BASE_DIR}/request_metrics_nocache.json" \
-  --metrics-gptcache "${METRICS_BASE_DIR}/request_metrics_gptcache.json" \
-  --metrics-contextcache "${METRICS_BASE_DIR}/request_metrics_contextcache.json" \
+  --run "nocache:${METRICS_BASE_DIR}/request_metrics_nocache.json" \
+  --run "gptcache:${METRICS_BASE_DIR}/request_metrics_gptcache.json" \
+  --run "contextcache:${METRICS_BASE_DIR}/request_metrics_contextcache.json" \
+  --run "adaptive_slo:${METRICS_BASE_DIR}/request_metrics_adaptive_slo.json" \
   --output-dir "${compare_output_dir}" \
   --prefix "compare"
