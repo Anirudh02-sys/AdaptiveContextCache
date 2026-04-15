@@ -2,13 +2,19 @@
 """
 Compare latency, accuracy, and SLO attainment across multiple experiments.
 
-Example:
+Legacy (exactly three runs, fixed keys):
   python3 scripts/compare_experiments.py \
     --metrics-nocache data/test_apps/example/request_metrics_nocache.json \
     --metrics-gptcache data/test_apps/example/request_metrics_gptcache.json \
     --metrics-contextcache data/test_apps/example/request_metrics_contextcache.json \
     --output-dir data/test_apps/example/plots/compare \
     --prefix compare
+
+Flexible (any number of runs; optional request log path for avg latency):
+  python3 scripts/compare_experiments.py \
+    --run nocache:/path/request_metrics_nocache.json \
+    --run gptcache:/path/request_metrics_gptcache.json \
+    --output-dir plots/compare --prefix compare
 """
 
 from __future__ import annotations
@@ -16,7 +22,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import Any, Dict, List, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import matplotlib
 
@@ -24,14 +31,52 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+DEFAULT_RUN_LABELS: Dict[str, str] = {
+    "nocache": "no-cache",
+    "gptcache": "gptcache",
+    "contextcache": "contextcache",
+    "adaptive_load": "adaptive context (load)",
+    "adaptive_slo": "adaptive context (SLO)",
+}
+
+
+@dataclass(frozen=True)
+class ExperimentRun:
+    """One experiment: stable key, legend label, metrics JSON path, resolved log path, loaded metrics."""
+
+    key: str
+    label: str
+    metrics_path: str
+    log_path: str
+    metrics: Dict[str, Any]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare latency, accuracy, and SLO attainment across experiments."
     )
-    parser.add_argument("--metrics-nocache", required=True, help="Metrics JSON for no-cache mode")
-    parser.add_argument("--metrics-gptcache", required=True, help="Metrics JSON for gptcache mode")
     parser.add_argument(
-        "--metrics-contextcache", required=True, help="Metrics JSON for contextcache mode"
+        "--run",
+        action="append",
+        default=None,
+        metavar="KEY:METRICS_JSON[:LOG_JSONL]",
+        help=(
+            "Repeat for each experiment. KEY is a short id (e.g. nocache, adaptive_load). "
+            "If LOG_JSONL is omitted, it is inferred from the metrics filename "
+            "(request_metrics_<suffix>.json -> request_log_<suffix>.jsonl)."
+        ),
+    )
+    parser.add_argument(
+        "--label",
+        action="append",
+        default=None,
+        metavar="KEY:Display name",
+        help="Override legend label for KEY (repeatable).",
+    )
+    parser.add_argument("--metrics-nocache", default=None, help="(legacy) Metrics JSON for no-cache mode")
+    parser.add_argument("--metrics-gptcache", default=None, help="(legacy) Metrics JSON for gptcache mode")
+    parser.add_argument(
+        "--metrics-contextcache", default=None, help="(legacy) Metrics JSON for contextcache mode"
     )
     parser.add_argument(
         "--output-dir",
@@ -46,9 +91,114 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_json(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def parse_label_flags(label_args: Optional[Sequence[str]]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if not label_args:
+        return out
+    for raw in label_args:
+        if ":" not in raw:
+            continue
+        key, display = raw.split(":", 1)
+        key = key.strip()
+        display = display.strip()
+        if key:
+            out[key] = display
+    return out
+
+
+def infer_request_log_path(metrics_path: str) -> str:
+    """
+    Infer request log path from metrics path when naming follows:
+      request_metrics_<suffix>.json -> request_log_<suffix>.jsonl
+    """
+    base_dir = os.path.dirname(os.path.abspath(metrics_path))
+    base = os.path.basename(metrics_path)
+    if base.startswith("request_metrics_") and base.endswith(".json"):
+        mid = base[len("request_metrics_") : -len(".json")]
+        return os.path.join(base_dir, f"request_log_{mid}.jsonl")
+    if "request_metrics" in base and base.endswith(".json"):
+        return os.path.join(
+            base_dir,
+            base.replace("request_metrics", "request_log").replace(".json", ".jsonl"),
+        )
+    stem, _ext = os.path.splitext(base)
+    return os.path.join(base_dir, f"{stem}_log.jsonl")
+
+
+def parse_run_arg(line: str) -> Tuple[str, str, Optional[str]]:
+    """Parse KEY:METRICS[:LOG]."""
+    parts = line.split(":")
+    if len(parts) < 2:
+        raise ValueError(f"Invalid --run value (need KEY:METRICS[:LOG]): {line!r}")
+    key = parts[0].strip()
+    if not key:
+        raise ValueError(f"Invalid --run (empty key): {line!r}")
+    if len(parts) == 2:
+        return key, parts[1].strip(), None
+    metrics_path = parts[1].strip()
+    log_path = ":".join(parts[2:]).strip()
+    return key, metrics_path, log_path or None
+
+
+def load_experiment_runs(
+    specs: Sequence[Tuple[str, str, Optional[str]]],
+    label_overrides: Optional[Dict[str, str]] = None,
+) -> List[ExperimentRun]:
+    """Load metrics JSON (and infer or attach log paths) for each (key, metrics_path, log_override)."""
+    label_over = label_overrides or {}
+    runs: List[ExperimentRun] = []
+    for key, metrics_path, log_override in specs:
+        if not metrics_path or not os.path.isfile(metrics_path):
+            raise SystemExit(f"error: metrics file not found for key {key!r}: {metrics_path}")
+        log_path = log_override if log_override else infer_request_log_path(metrics_path)
+        label = label_over.get(key) or DEFAULT_RUN_LABELS.get(key) or key
+        with open(metrics_path, "r", encoding="utf-8") as f:
+            metrics = json.load(f)
+        runs.append(
+            ExperimentRun(
+                key=key,
+                label=label,
+                metrics_path=os.path.abspath(metrics_path),
+                log_path=os.path.abspath(log_path),
+                metrics=metrics,
+            )
+        )
+    return runs
+
+
+def build_runs_from_args(args: argparse.Namespace) -> List[ExperimentRun]:
+    label_over = parse_label_flags(args.label)
+
+    if args.run:
+        specs = [parse_run_arg(x) for x in args.run]
+    else:
+        missing = [
+            n
+            for n, p in (
+                ("--metrics-nocache", args.metrics_nocache),
+                ("--metrics-gptcache", args.metrics_gptcache),
+                ("--metrics-contextcache", args.metrics_contextcache),
+            )
+            if not p
+        ]
+        if missing:
+            raise SystemExit(
+                "error: provide either --run KEY:METRICS[:LOG] (repeatable) or all three legacy flags: "
+                + ", ".join(
+                    [
+                        "--metrics-nocache",
+                        "--metrics-gptcache",
+                        "--metrics-contextcache",
+                    ]
+                )
+            )
+        specs = [
+            ("nocache", args.metrics_nocache, None),
+            ("gptcache", args.metrics_gptcache, None),
+            ("contextcache", args.metrics_contextcache, None),
+        ]
+
+    return load_experiment_runs(specs, label_over)
 
 
 def _sorted_per_app(metrics: Dict[str, Any]) -> List[Tuple[int, Dict[str, Any]]]:
@@ -76,45 +226,25 @@ def _save(fig: Any, output_dir: str, filename: str) -> str:
     return out_path
 
 
-def plot_latency_compare(
-    nocache: Dict[str, Any],
-    gptcache: Dict[str, Any],
-    contextcache: Dict[str, Any],
-    output_dir: str,
-    prefix: str,
-) -> str:
-    rows0 = _sorted_per_app(nocache)
+def plot_latency_compare_multi(runs: Sequence[ExperimentRun], output_dir: str, prefix: str) -> str:
+    if not runs:
+        raise ValueError("runs must be non-empty")
+    rows0 = _sorted_per_app(runs[0].metrics)
     app_ids = [app_id for app_id, _ in rows0]
 
     def p99(m: Dict[str, Any]) -> List[float]:
         rows = _sorted_per_app(m)
         return [float(stats.get("p99_latency_ms", 0.0)) for _, stats in rows]
 
-    p0 = p99(nocache)
-    p1 = p99(gptcache)
-    p2 = p99(contextcache)
-
     fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(app_ids, p0, marker="o", label="no-cache p99 (ms)")
-    ax.plot(app_ids, p1, marker="o", label="gptcache p99 (ms)")
-    ax.plot(app_ids, p2, marker="o", label="contextcache p99 (ms)")
-    ax.set_title("P99 Latency by Application (All Experiments)")
+    for run in runs:
+        ax.plot(app_ids, p99(run.metrics), marker="o", label=f"{run.label} p99 (ms)")
+    ax.set_title("P99 Latency by Application")
     ax.set_xlabel("Application ID")
     ax.set_ylabel("Latency p99 (ms)")
     ax.grid(alpha=0.3)
     ax.legend()
     return _save(fig, output_dir, f"{prefix}_latency_compare.png")
-
-
-def _infer_log_path_from_metrics(metrics_path: str, mode_suffix: str) -> str:
-    """
-    Metrics are written as:
-      request_metrics_{mode_suffix}.json
-    Logs are written as:
-      request_log_{mode_suffix}.jsonl
-    """
-    base_dir = os.path.dirname(metrics_path)
-    return os.path.join(base_dir, f"request_log_{mode_suffix}.jsonl")
 
 
 def _load_avg_latency_ms_from_log(log_path: str) -> Dict[int, float]:
@@ -147,38 +277,18 @@ def _load_avg_latency_ms_from_log(log_path: str) -> Dict[int, float]:
     return out
 
 
-def plot_avg_latency_compare(
-    nocache_metrics: Dict[str, Any],
-    gptcache_metrics: Dict[str, Any],
-    contextcache_metrics: Dict[str, Any],
-    nocache_metrics_path: str,
-    gptcache_metrics_path: str,
-    contextcache_metrics_path: str,
-    output_dir: str,
-    prefix: str,
-) -> str:
-    rows0 = _sorted_per_app(nocache_metrics)
+def plot_avg_latency_compare_multi(runs: Sequence[ExperimentRun], output_dir: str, prefix: str) -> str:
+    if not runs:
+        raise ValueError("runs must be non-empty")
+    rows0 = _sorted_per_app(runs[0].metrics)
     app_ids = [app_id for app_id, _ in rows0]
 
-    avg0 = _load_avg_latency_ms_from_log(
-        _infer_log_path_from_metrics(nocache_metrics_path, "nocache")
-    )
-    avg1 = _load_avg_latency_ms_from_log(
-        _infer_log_path_from_metrics(gptcache_metrics_path, "gptcache")
-    )
-    avg2 = _load_avg_latency_ms_from_log(
-        _infer_log_path_from_metrics(contextcache_metrics_path, "contextcache")
-    )
-
-    p0 = [float(avg0.get(app_id, 0.0)) for app_id in app_ids]
-    p1 = [float(avg1.get(app_id, 0.0)) for app_id in app_ids]
-    p2 = [float(avg2.get(app_id, 0.0)) for app_id in app_ids]
-
     fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(app_ids, p0, marker="o", label="no-cache avg (ms)")
-    ax.plot(app_ids, p1, marker="o", label="gptcache avg (ms)")
-    ax.plot(app_ids, p2, marker="o", label="contextcache avg (ms)")
-    ax.set_title("Average Latency by Application (All Experiments)")
+    for run in runs:
+        avg = _load_avg_latency_ms_from_log(run.log_path)
+        series = [float(avg.get(app_id, 0.0)) for app_id in app_ids]
+        ax.plot(app_ids, series, marker="o", label=f"{run.label} avg (ms)")
+    ax.set_title("Average Latency by Application (from request logs)")
     ax.set_xlabel("Application ID")
     ax.set_ylabel("Average latency (ms)")
     ax.grid(alpha=0.3)
@@ -186,14 +296,10 @@ def plot_avg_latency_compare(
     return _save(fig, output_dir, f"{prefix}_latency_avg_compare.png")
 
 
-def plot_accuracy_compare(
-    nocache: Dict[str, Any],
-    gptcache: Dict[str, Any],
-    contextcache: Dict[str, Any],
-    output_dir: str,
-    prefix: str,
-) -> str:
-    rows0 = _sorted_per_app(nocache)
+def plot_accuracy_compare_multi(runs: Sequence[ExperimentRun], output_dir: str, prefix: str) -> str:
+    if not runs:
+        raise ValueError("runs must be non-empty")
+    rows0 = _sorted_per_app(runs[0].metrics)
     app_ids = [app_id for app_id, _ in rows0]
 
     def accuracy_metric_name(m: Dict[str, Any]) -> str:
@@ -202,21 +308,21 @@ def plot_accuracy_compare(
             return "avg_token_f1"
         return metric
 
-    chosen_metric = accuracy_metric_name(contextcache)
+    chosen_metric = accuracy_metric_name(runs[-1].metrics)
 
     def acc(m: Dict[str, Any], metric: str) -> List[float]:
         rows = _sorted_per_app(m)
         return [float(stats.get(metric, 0.0)) for _, stats in rows]
 
-    a0 = acc(nocache, chosen_metric)
-    a1 = acc(gptcache, chosen_metric)
-    a2 = acc(contextcache, chosen_metric)
-
     fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(app_ids, a0, marker="o", label=f"no-cache {chosen_metric}")
-    ax.plot(app_ids, a1, marker="o", label=f"gptcache {chosen_metric}")
-    ax.plot(app_ids, a2, marker="o", label=f"contextcache {chosen_metric}")
-    ax.set_title(f"Accuracy ({chosen_metric}) by Application (All Experiments)")
+    for run in runs:
+        ax.plot(
+            app_ids,
+            acc(run.metrics, chosen_metric),
+            marker="o",
+            label=f"{run.label} {chosen_metric}",
+        )
+    ax.set_title(f"Accuracy ({chosen_metric}) by Application")
     ax.set_xlabel("Application ID")
     ax.set_ylabel(chosen_metric)
     ax.grid(alpha=0.3)
@@ -224,16 +330,15 @@ def plot_accuracy_compare(
     return _save(fig, output_dir, f"{prefix}_accuracy_compare.png")
 
 
-def plot_slo_compare(
-    nocache: Dict[str, Any],
-    gptcache: Dict[str, Any],
-    contextcache: Dict[str, Any],
-    output_dir: str,
-    prefix: str,
-) -> Tuple[str, str]:
-    # Use app IDs from no-cache as reference (assumed same across experiments).
-    rows0 = _sorted_per_app(nocache)
+def plot_slo_compare_multi(runs: Sequence[ExperimentRun], output_dir: str, prefix: str) -> Tuple[str, str]:
+    if not runs:
+        raise ValueError("runs must be non-empty")
+    rows0 = _sorted_per_app(runs[0].metrics)
     app_ids = [app_id for app_id, _ in rows0]
+    n = len(runs)
+    bar_width = min(0.8 / max(n, 1), 0.28)
+    offsets = [(i - (n - 1) / 2.0) * bar_width for i in range(n)]
+    x = list(range(len(app_ids)))
 
     def latency_margins(m: Dict[str, Any]) -> List[float]:
         rows = _sorted_per_app(m)
@@ -246,7 +351,6 @@ def plot_slo_compare(
                 try:
                     t = float(target)
                     o = float(observed)
-                    # Positive margin means observed latency is better (lower) than target.
                     margin = t - o
                 except (TypeError, ValueError):
                     margin = 0.0
@@ -256,10 +360,7 @@ def plot_slo_compare(
     def accuracy_margins(m: Dict[str, Any]) -> List[float]:
         rows = _sorted_per_app(m)
         margins: List[float] = []
-        # Use this experiment's configured accuracy metric name, defaulting to avg_sequence_ratio.
-        accuracy_metric = str(
-            m.get("slo_summary", {}).get("accuracy_metric", "avg_sequence_ratio")
-        )
+        accuracy_metric = str(m.get("slo_summary", {}).get("accuracy_metric", "avg_sequence_ratio"))
         for _, stats in rows:
             target = (stats.get("slo_target", {}) or {}).get("accuracy_slo")
             observed = (stats.get("slo_observed", {}) or {}).get(accuracy_metric)
@@ -268,50 +369,36 @@ def plot_slo_compare(
                 try:
                     t = float(target)
                     o = float(observed)
-                    # Positive margin means observed accuracy is better (higher) than target.
                     margin = o - t
                 except (TypeError, ValueError):
                     margin = 0.0
             margins.append(margin)
         return margins
 
-    lat0 = latency_margins(nocache)
-    lat1 = latency_margins(gptcache)
-    lat2 = latency_margins(contextcache)
-
-    acc0 = accuracy_margins(nocache)
-    acc1 = accuracy_margins(gptcache)
-    acc2 = accuracy_margins(contextcache)
-
-    # Multi-bar latency SLO margin per app.
-    x = list(range(len(app_ids)))
-    width = 0.25
-
     fig_lat, ax_lat = plt.subplots(figsize=(12, 5))
     ax_lat.axhline(0.0, color="#666666", linewidth=1, linestyle="--")
-    ax_lat.bar([xi - width for xi in x], lat0, width=width, label="no-cache")
-    ax_lat.bar(x, lat1, width=width, label="gptcache")
-    ax_lat.bar([xi + width for xi in x], lat2, width=width, label="contextcache")
+    for off, run in zip(offsets, runs):
+        lat = latency_margins(run.metrics)
+        ax_lat.bar([xi + off for xi in x], lat, width=bar_width, label=run.label)
     ax_lat.set_xticks(x)
     ax_lat.set_xticklabels(app_ids)
     ax_lat.set_xlabel("Application ID")
     ax_lat.set_ylabel("Latency SLO margin (target - observed, ms)")
-    ax_lat.set_title("Latency SLO Margin by Application (All Experiments)")
+    ax_lat.set_title("Latency SLO Margin by Application")
     ax_lat.grid(axis="y", alpha=0.3)
     ax_lat.legend()
     lat_path = _save(fig_lat, output_dir, f"{prefix}_latency_slo_compare.png")
 
-    # Multi-bar accuracy SLO margin per app.
     fig_acc, ax_acc = plt.subplots(figsize=(12, 5))
     ax_acc.axhline(0.0, color="#666666", linewidth=1, linestyle="--")
-    ax_acc.bar([xi - width for xi in x], acc0, width=width, label="no-cache")
-    ax_acc.bar(x, acc1, width=width, label="gptcache")
-    ax_acc.bar([xi + width for xi in x], acc2, width=width, label="contextcache")
+    for off, run in zip(offsets, runs):
+        accm = accuracy_margins(run.metrics)
+        ax_acc.bar([xi + off for xi in x], accm, width=bar_width, label=run.label)
     ax_acc.set_xticks(x)
     ax_acc.set_xticklabels(app_ids)
     ax_acc.set_xlabel("Application ID")
     ax_acc.set_ylabel("Accuracy SLO margin (observed - target)")
-    ax_acc.set_title("Accuracy SLO Margin by Application (All Experiments)")
+    ax_acc.set_title("Accuracy SLO Margin by Application")
     ax_acc.grid(axis="y", alpha=0.3)
     ax_acc.legend()
     acc_path = _save(fig_acc, output_dir, f"{prefix}_accuracy_slo_compare.png")
@@ -319,40 +406,26 @@ def plot_slo_compare(
     return lat_path, acc_path
 
 
+def write_comparison_plots(runs: Sequence[ExperimentRun], output_dir: str, prefix: str) -> List[str]:
+    """Generate all comparison figures; returns list of written paths."""
+    _ensure_output_dir(output_dir)
+    paths: List[str] = []
+    paths.append(plot_latency_compare_multi(runs, output_dir, prefix))
+    paths.append(plot_avg_latency_compare_multi(runs, output_dir, prefix))
+    paths.append(plot_accuracy_compare_multi(runs, output_dir, prefix))
+    lat_slo, acc_slo = plot_slo_compare_multi(runs, output_dir, prefix)
+    paths.extend([lat_slo, acc_slo])
+    return paths
+
+
 def main() -> None:
     args = parse_args()
-    _ensure_output_dir(args.output_dir)
-
-    nocache = _load_json(args.metrics_nocache)
-    gptcache = _load_json(args.metrics_gptcache)
-    contextcache = _load_json(args.metrics_contextcache)
-
-    latency_plot = plot_latency_compare(nocache, gptcache, contextcache, args.output_dir, args.prefix)
-    avg_latency_plot = plot_avg_latency_compare(
-        nocache,
-        gptcache,
-        contextcache,
-        args.metrics_nocache,
-        args.metrics_gptcache,
-        args.metrics_contextcache,
-        args.output_dir,
-        args.prefix,
-    )
-    accuracy_plot = plot_accuracy_compare(
-        nocache, gptcache, contextcache, args.output_dir, args.prefix
-    )
-    lat_slo_plot, acc_slo_plot = plot_slo_compare(
-        nocache, gptcache, contextcache, args.output_dir, args.prefix
-    )
-
+    runs = build_runs_from_args(args)
+    paths = write_comparison_plots(runs, args.output_dir, args.prefix)
     print("Wrote comparison plots:")
-    print(f"- {latency_plot}")
-    print(f"- {avg_latency_plot}")
-    print(f"- {accuracy_plot}")
-    print(f"- {lat_slo_plot}")
-    print(f"- {acc_slo_plot}")
+    for p in paths:
+        print(f"- {p}")
 
 
 if __name__ == "__main__":
     main()
-

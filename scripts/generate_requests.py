@@ -458,7 +458,7 @@ def _thread_worker(
                     }
                 ],
                 "temperature": 0,
-                "max_tokens": 10,
+                "max_tokens": 200,
             }
 
             ok = False
@@ -626,7 +626,7 @@ def _run_warmup_conversation(
                 }
             ],
             "temperature": 0,
-            "max_tokens": 10,
+            "max_tokens": 200,
         }
 
         ok = False
