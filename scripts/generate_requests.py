@@ -458,8 +458,11 @@ def _thread_worker(
                     }
                 ],
                 "temperature": 0,
-                "max_tokens": 200,
+                "max_tokens": 50,
             }
+            app_server_id_map = config.get("_app_id_to_server_id", {})
+            if app_id in app_server_id_map:
+                payload["application_id"] = app_server_id_map[app_id]
 
             ok = False
             response_text = ""
@@ -626,7 +629,7 @@ def _run_warmup_conversation(
                 }
             ],
             "temperature": 0,
-            "max_tokens": 200,
+            "max_tokens": 50,
         }
 
         ok = False
@@ -807,6 +810,52 @@ def _run_warmup_phase(
 
     return summary
 
+def _register_applications_with_server(
+    config: Dict[str, Any],
+) -> Dict[int, str]:
+    """Register application SLO targets with the cache server via POST /v1/applications.
+
+    Returns a mapping of integer app_id -> server-issued UUID string.
+    If no SLO expectations are configured, returns an empty dict.
+    """
+    slo_expectations = config.get("application_slo_expectations", {})
+    if not slo_expectations:
+        return {}
+
+    base_url = str(config.get("base_url", "http://127.0.0.1:8012")).rstrip("/")
+    url = f"{base_url}/v1/applications"
+    mapping: Dict[int, str] = {}
+
+    for app_id_str, slo in sorted(slo_expectations.items()):
+        app_id = int(app_id_str)
+        latency_target = slo.get("latency_p99_ms")
+        accuracy_target = slo.get("accuracy_slo")
+        if latency_target is None or accuracy_target is None:
+            continue
+        body = {
+            "latency_p99_ms": float(latency_target),
+            "accuracy_slo": float(accuracy_target),
+        }
+        try:
+            resp = requests.post(url, json=body, timeout=10)
+            resp.raise_for_status()
+            server_app_id = resp.json().get("application_id", "")
+            if server_app_id:
+                mapping[app_id] = str(server_app_id)
+                print(
+                    f"[slo-register] app {app_id} -> server_id={server_app_id} "
+                    f"(latency_p99_ms={latency_target}, accuracy_slo={accuracy_target})",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(
+                f"[slo-register] WARNING: failed to register app {app_id}: {exc}",
+                flush=True,
+            )
+
+    return mapping
+
+
 def run(config: Dict[str, Any]) -> Dict[str, Any]:
     warmup_log_path = str(config.get("warmup_log_path", "")).strip()
     if warmup_log_path:
@@ -832,6 +881,14 @@ def run(config: Dict[str, Any]) -> Dict[str, Any]:
     if warmup_summary is not None:
         print("[warmup] summary (JSON):", flush=True)
         print(json.dumps(warmup_summary, ensure_ascii=False, indent=2))
+
+    app_id_to_server_id = _register_applications_with_server(config)
+    config["_app_id_to_server_id"] = app_id_to_server_id
+    if app_id_to_server_id:
+        print(
+            f"[slo-register] registered {len(app_id_to_server_id)} application(s) with server",
+            flush=True,
+        )
 
     app_records = _load_app_records(config)
     if not app_records:
