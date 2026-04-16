@@ -76,9 +76,9 @@ def on_application_registry_changed() -> None:
             openai_cache.config.context_cache_window_factor_by_app = {}
         return
 
-    # Build per-app "strictness" score from SLO targets.
-    # - latency_strict: lower latency target => higher strictness (use inverse latency)
-    # - accuracy_strict: higher accuracy target => higher strictness
+    # Build per-app directional score from SLO targets.
+    # - latency pressure: lower latency_p99_ms target => stricter (use 1/latency)
+    # - accuracy pressure: higher accuracy_slo target => stricter
     lat_inv: Dict[str, float] = {}
     acc: Dict[str, float] = {}
     for app_id, rec in items:
@@ -89,7 +89,6 @@ def on_application_registry_changed() -> None:
         if a is not None:
             acc[app_id] = a
 
-    # Normalize to [0,1] with min-max; missing signals contribute 0.
     def _minmax_norm(vals: Dict[str, float]) -> Dict[str, float]:
         if not vals:
             return {}
@@ -103,33 +102,24 @@ def on_application_registry_changed() -> None:
     lat_n = _minmax_norm(lat_inv)
     acc_n = _minmax_norm(acc)
 
-    alpha = 0.7  # weight latency strictness
-    beta = 0.3   # weight accuracy strictness
-    strict: Dict[str, float] = {}
-    for app_id, _ in items:
-        strict[app_id] = alpha * lat_n.get(app_id, 0.0) + beta * acc_n.get(app_id, 0.0)
+    # Weighted directional score: negative = favor latency (shorter window),
+    # positive = favor accuracy (longer window).
+    # alpha > beta biases toward latency reduction.
+    alpha = 0.8
+    beta = 0.2
 
-    # Convert strictness into multiplicative factors. Keep it cheap and bounded.
-    #
-    # Directional policy:
-    # - latency-sensitive apps (tighter latency than accuracy) -> smaller factor (<1)
-    #   to use shorter context windows and favor cache hits.
-    # - accuracy-sensitive apps (tighter accuracy than latency) -> larger factor (>1)
-    #   to use longer context windows and favor contextual precision.
-    #
-    # score in [-1, +1] approximately:
-    #   score = normalized_accuracy_pressure - normalized_latency_pressure
-    gamma = 0.8
-    min_f = 0.6
-    max_f = 2.2
+    # center < 1.0 shifts all factors downward so the average window is
+    # smaller than the base — an overall latency improvement. gamma controls
+    # how aggressively the spread deviates from center.
+    center = 0.5
+    gamma = 1.5
+    min_f = 0.1
+    max_f = 2.0
     factors = {}
     for app_id, _ in items:
-        score = acc_n.get(app_id, 0.0) - lat_n.get(app_id, 0.0)
-        f = 1.0 + gamma * score
-        if f < min_f:
-            f = min_f
-        elif f > max_f:
-            f = max_f
+        score = beta * acc_n.get(app_id, 0.0) - alpha * lat_n.get(app_id, 0.0)
+        f = center + gamma * score
+        f = max(min_f, min(max_f, f))
         factors[app_id] = float(f)
 
     # Install factors (only for currently-registered apps).

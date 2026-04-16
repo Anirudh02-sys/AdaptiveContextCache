@@ -184,7 +184,9 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
             cur_context_data = np.array([embedding_data])
             pre_id = -1
         elif context_res:
-            # Compute dialogue-history embeddings from extracted context_res.
+            _cw = chat_cache.config.effective_context_window_len(_application_id)
+            max_history = max(0, _cw - 1)
+            context_res = context_res[-max_history:] if max_history > 0 else []
             cur_context_data = [
                 time_cal(
                     chat_cache.embedding_func,
@@ -193,11 +195,7 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                 )(ori_data, extra_param=context.get("embedding_func", None))
                 for ori_data in context_res
             ]
-            # Append current-query embedding as the last element in context_data.
             cur_context_data.append(embedding_data)
-            _cw = chat_cache.config.effective_context_window_len(_application_id)
-            if len(cur_context_data) > _cw:
-                cur_context_data = cur_context_data[-_cw:]
             chat_cache.config.context_emb = cur_context_data
             cur_context_data = np.array(cur_context_data)
             pre_id = cur_id - 1
@@ -553,7 +551,9 @@ async def aadapt(
             pre_id = -1
             cur_context_data = np.array([embedding_data])
         elif context_res:
-            # Compute dialogue-history embeddings from extracted context_res.
+            _cw = chat_cache.config.effective_context_window_len(_application_id)
+            max_history = max(0, _cw - 1)
+            context_res = context_res[-max_history:] if max_history > 0 else []
             cur_context_data = [
                 time_cal(
                     chat_cache.embedding_func,
@@ -563,9 +563,6 @@ async def aadapt(
                 for ori_data in context_res
             ]
             cur_context_data.append(embedding_data)
-            _cw = chat_cache.config.effective_context_window_len(_application_id)
-            if len(cur_context_data) > _cw:
-                cur_context_data = cur_context_data[-_cw:]
             cur_context_data = np.array(cur_context_data)
             pre_id = cur_id - 1
         else:
