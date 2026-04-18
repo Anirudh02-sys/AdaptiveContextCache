@@ -44,6 +44,68 @@ _slo_adaptive_beta: float = 0.2
 _slo_adaptive_baseline_center: float = -0.25
 
 
+def _effective_window_from_parts(
+    *,
+    base_window: int,
+    overall_factor: float,
+    delta: int,
+    window_min: int,
+    window_max: int,
+) -> int:
+    base_component = int(round(float(base_window) * float(overall_factor)))
+    raw = int(base_component) + int(delta)
+    return max(int(window_min), min(raw, int(window_max)))
+
+
+def _log_slo_window_update(
+    *,
+    trigger: str,
+    old_deltas: Dict[str, int],
+    new_deltas: Dict[str, int],
+    slo_targets_by_app: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> None:
+    cfg = cache.config
+    base_n = int(cfg.context_cache_window_len)
+    overall = float(getattr(cfg, "context_cache_overall_factor", 1.0))
+    w_min = int(getattr(cfg, "context_cache_window_min", 1))
+    w_max = int(cfg.context_cache_window_max)
+
+    app_ids = sorted({str(aid) for aid in old_deltas.keys()} | {str(aid) for aid in new_deltas.keys()})
+    targets = slo_targets_by_app or {}
+    for app_id in app_ids:
+        target = targets.get(app_id, {}) if isinstance(targets.get(app_id, {}), dict) else {}
+        target_latency = target.get("latency_p99_ms")
+        target_accuracy = target.get("accuracy_slo")
+        old_delta = int(old_deltas.get(app_id, 0))
+        new_delta = int(new_deltas.get(app_id, 0))
+        old_effective = _effective_window_from_parts(
+            base_window=base_n,
+            overall_factor=overall,
+            delta=old_delta,
+            window_min=w_min,
+            window_max=w_max,
+        )
+        new_effective = _effective_window_from_parts(
+            base_window=base_n,
+            overall_factor=overall,
+            delta=new_delta,
+            window_min=w_min,
+            window_max=w_max,
+        )
+        changed = (old_delta != new_delta) or (old_effective != new_effective)
+        # Keep a machine-parseable line visible in logs even when logger routing changes.
+        msg = (
+            f"window_update app_id={app_id} trigger={trigger} base_window={base_n} "
+            f"overall_factor={overall:.6g} window_min={w_min} window_max={w_max} "
+            f"target_latency_p99_ms={target_latency} target_accuracy_slo={target_accuracy} "
+            f"old_slo_delta={old_delta:+d} new_slo_delta={new_delta:+d} "
+            f"old_effective_window={old_effective} new_effective_window={new_effective} "
+            f"changed={str(changed).lower()}"
+        )
+        print(msg, flush=True)
+        logging.getLogger("gptcache").info(msg)
+
+
 def on_application_registry_changed() -> None:
     """Recompute per-app context-window deltas from registered SLO targets.
 
@@ -65,6 +127,8 @@ def on_application_registry_changed() -> None:
     # Snapshot quickly under the lock.
     with _application_slos_lock:
         items = list(_application_slos.items())
+    slo_targets_by_app = {str(app_id): dict(rec or {}) for app_id, rec in items}
+    old_deltas = dict(getattr(cache.config, "context_cache_window_delta_by_app", {}) or {})
 
     # If slo_adaptive is off, keep per-app offsets neutral (0).
     # This makes app-level tuning opt-in via --slo-adaptive / config.slo_adaptive.
@@ -73,6 +137,12 @@ def on_application_registry_changed() -> None:
         cache.config.context_cache_window_delta_by_app = dict(zeros)
         if openai_cache is not None:
             openai_cache.config.context_cache_window_delta_by_app = dict(zeros)
+        _log_slo_window_update(
+            trigger="slo_registry_update_disabled",
+            old_deltas=old_deltas,
+            new_deltas=zeros,
+            slo_targets_by_app=slo_targets_by_app,
+        )
         return
 
     # If no apps (or only one), keep deltas empty / neutral.
@@ -80,6 +150,12 @@ def on_application_registry_changed() -> None:
         cache.config.context_cache_window_delta_by_app = {}
         if openai_cache is not None:
             openai_cache.config.context_cache_window_delta_by_app = {}
+        _log_slo_window_update(
+            trigger="slo_registry_update_insufficient_apps",
+            old_deltas=old_deltas,
+            new_deltas={},
+            slo_targets_by_app=slo_targets_by_app,
+        )
         return
 
     # Build per-app directional score from SLO targets.
@@ -140,6 +216,12 @@ def on_application_registry_changed() -> None:
     cache.config.context_cache_window_delta_by_app = dict(deltas)
     if openai_cache is not None:
         openai_cache.config.context_cache_window_delta_by_app = dict(deltas)
+    _log_slo_window_update(
+        trigger="slo_registry_update",
+        old_deltas=old_deltas,
+        new_deltas=deltas,
+        slo_targets_by_app=slo_targets_by_app,
+    )
 
 
 class CacheData(BaseModel):
