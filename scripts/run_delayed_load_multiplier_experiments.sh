@@ -18,7 +18,7 @@
 # Layout:
 #   data/test_apps/load_mult_delayed_compare/lm10_delayed240/request_metrics_<suffix>.json
 #   data/test_apps/load_mult_delayed_compare/plots/lm10_delayed240/<suffix>/   (per-run plots)
-#   data/test_apps/load_mult_delayed_compare/plots/compare_lm10_delayed240/    (compare plot)
+#   data/test_apps/load_mult_delayed_compare/plots/compare_lm10_delayed240/    (compare plot + timeseries)
 #
 # Usage:
 #   ./scripts/run_delayed_load_multiplier_experiments.sh
@@ -241,13 +241,13 @@ should_run() {
 }
 
 # TODO(re-enable): nocache baseline run (needed for accuracy comparisons and compare_all plot).
-# if should_run "nocache"; then
-#   run_experiment "no-cache" "nocache"
-# fi
+if should_run "nocache"; then
+  run_experiment "no-cache" "nocache"
+fi
 # TODO(re-enable): gptcache mode.
-# if should_run "gptcache"; then
-#   run_experiment "gptcache" "gptcache"
-# fi
+if should_run "gptcache"; then
+  run_experiment "gptcache" "gptcache"
+fi
 if should_run "contextcache"; then
   run_experiment "contextcache" "contextcache"
 fi
@@ -264,12 +264,27 @@ compare_dir="${PLOTS_ROOT}/compare_${LM_TAG}"
 mkdir -p "${compare_dir}"
 
 "${PYTHON_BIN}" scripts/compare_experiments.py \
-  `# TODO(re-enable): --run "nocache:${D_ABS}/${LM_TAG}/request_metrics_nocache.json"` \
-  `# TODO(re-enable): --run "gptcache:${D_ABS}/${LM_TAG}/request_metrics_gptcache.json"` \
+  --run "nocache:${D_ABS}/${LM_TAG}/request_metrics_nocache.json" \
+  --run "gptcache:${D_ABS}/${LM_TAG}/request_metrics_gptcache.json" \
   --run "contextcache:${D_ABS}/${LM_TAG}/request_metrics_contextcache.json" \
   --run "adaptive_load:${D_ABS}/${LM_TAG}/request_metrics_adaptive_load.json" \
   --output-dir "${compare_dir}" \
   --prefix "compare_${LM_TAG}"
+
+timeseries_suffix_args=()
+for suf in ${RUN_ONLY_SUFFIXES}; do
+  timeseries_suffix_args+=(--suffix "${suf}")
+done
+
+if ((${#timeseries_suffix_args[@]} > 0)); then
+  echo "Writing delayed experiment latency/accuracy time-series plots..."
+  "${PYTHON_BIN}" scripts/plot_delayed_experiment_timeseries.py \
+    --root-dir "${D_ABS}" \
+    --lm-tag "${LM_TAG}" \
+    "${timeseries_suffix_args[@]}" \
+    --output-dir "${compare_dir}" \
+    --prefix "delayed_timeseries"
+fi
 
 echo "All delayed-load-multiplier experiments complete."
 echo "  Metrics/logs: ${DATA_ROOT}/${LM_TAG}/"
