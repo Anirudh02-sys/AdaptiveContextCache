@@ -89,6 +89,7 @@ class LoadAdaptiveContextController:
         n = int(cfg.context_cache_window_len)
         if n < 1:
             return
+        w_min = int(getattr(cfg, "context_cache_window_min", 2))
         w_max = int(cfg.context_cache_window_max)
         w = cfg.effective_context_window_len(None)
         ratio_req = float(cfg.load_adaptive_ratio)
@@ -194,7 +195,7 @@ class LoadAdaptiveContextController:
         if high_load and low_load:
             return
         if high_load:
-            new_w = max(1, w - 1)
+            new_w = max(w_min, w - 1)
             if new_w != w:
                 cfg.context_cache_overall_factor = new_w / float(n)
                 _logger.info(

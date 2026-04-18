@@ -36,23 +36,23 @@
   },
   "application_slo_expectations": {
     "0": {
-      "latency_p99_ms": 13000,
-      "accuracy_slo": 0.04
+      "latency_p99_ms": 2700,
+      "accuracy_slo": 0.05
     },
     "1": {
-      "latency_p99_ms": 18500,
+      "latency_p99_ms": 2600,
       "accuracy_slo": 0.08
     },
     "2": {
-      "latency_p99_ms": 14000,
+      "latency_p99_ms": 1920,
       "accuracy_slo": 0.06
     },
     "3": {
-      "latency_p99_ms": 15000,
+      "latency_p99_ms": 4200,
       "accuracy_slo": 0.045
     },
     "4": {
-      "latency_p99_ms": 21000,
+      "latency_p99_ms": 2650,
       "accuracy_slo": 0.08
     }
   },

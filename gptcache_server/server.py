@@ -38,6 +38,11 @@ dry_run: bool = False
 _application_slos: Dict[str, Dict[str, Any]] = {}
 _application_slos_lock = Lock()
 
+# Tunable via CLI (--slo-adaptive-alpha, etc.); applied in on_application_registry_changed.
+_slo_adaptive_alpha: float = 0.8
+_slo_adaptive_beta: float = 0.2
+_slo_adaptive_baseline_center: float = -0.25
+
 
 def on_application_registry_changed() -> None:
     """Recompute per-app context-window deltas from registered SLO targets.
@@ -106,8 +111,8 @@ def on_application_registry_changed() -> None:
     # Weighted directional score: negative = favor latency (shorter window),
     # positive = favor accuracy (longer window).
     # alpha > beta biases toward latency reduction.
-    alpha = 0.8
-    beta = 0.2
+    alpha = float(_slo_adaptive_alpha)
+    beta = float(_slo_adaptive_beta)
 
     # Map the normalized score to an integer turn offset. A strict-latency app
     # (lat_n=1, acc_n=0) gets score=-alpha and is mapped to the full available
@@ -119,7 +124,7 @@ def on_application_registry_changed() -> None:
     w_max = int(cache.config.context_cache_window_max)
     max_neg = max(0, base_n - 1)            # room to shrink (delta down to 1-base_n)
     max_pos = max(0, w_max - base_n)        # room to grow (delta up to w_max-base_n)
-    baseline_center = -0.25                  # turns added to every registered app
+    baseline_center = float(_slo_adaptive_baseline_center)
     deltas: Dict[str, int] = {}
     for app_id, _ in items:
         score = beta * acc_n.get(app_id, 0.0) - alpha * lat_n.get(app_id, 0.0)
@@ -438,6 +443,36 @@ def main():
         help="enable SLO-adaptive aspect (adaptivecontextcache; no-op until implemented).",
     )
     parser.add_argument(
+        "--slo-adaptive-alpha",
+        type=float,
+        default=0.8,
+        metavar="A",
+        help=(
+            "SLO-adaptive: weight on normalized inverse latency target in score "
+            "(default: 0.8). Larger => stronger shrink for strict-latency apps."
+        ),
+    )
+    parser.add_argument(
+        "--slo-adaptive-beta",
+        type=float,
+        default=0.2,
+        metavar="B",
+        help=(
+            "SLO-adaptive: weight on normalized accuracy target in score "
+            "(default: 0.2). Larger => stronger grow for strict-accuracy apps."
+        ),
+    )
+    parser.add_argument(
+        "--slo-adaptive-baseline-center",
+        type=float,
+        default=-0.25,
+        metavar="C",
+        help=(
+            "SLO-adaptive: additive turn bias applied to every app after score mapping "
+            "(default: -0.25). More negative => smaller windows on average."
+        ),
+    )
+    parser.add_argument(
         "-dr",
         "--dry-run",
         choices=["no", "yes"],
@@ -455,7 +490,26 @@ def main():
             "Applies after YAML init too (overrides config.context_cache_window_len from -f)."
         ),
     )
+    parser.add_argument(
+        "--context-cache-window-min",
+        type=int,
+        default=2,
+        metavar="NMIN",
+        help=(
+            "minimum effective dialogue window after load/SLO adaptation (default: 2, "
+            "same as gptcache.config.Config). Prevents adaptive shrink from collapsing "
+            "context matching below this floor."
+        ),
+    )
     args = parser.parse_args()
+    if args.slo_adaptive_alpha <= 0:
+        parser.error("--slo-adaptive-alpha must be > 0")
+    if args.slo_adaptive_beta <= 0:
+        parser.error("--slo-adaptive-beta must be > 0")
+    if args.context_cache_window_min < 1:
+        parser.error("--context-cache-window-min must be >= 1")
+    if args.context_cache_window_min > args.context_cache_window_len:
+        parser.error("--context-cache-window-min must be <= --context-cache-window-len")
     if args.load_adaptive_ratio <= 1.0:
         parser.error("--load-adaptive-ratio must be > 1.0")
     if args.load_adaptive_token_ratio <= 1.0:
@@ -482,6 +536,11 @@ def main():
     global cache_file_key
     global server_mode
     global dry_run
+    global _slo_adaptive_alpha, _slo_adaptive_beta, _slo_adaptive_baseline_center
+
+    _slo_adaptive_alpha = float(args.slo_adaptive_alpha)
+    _slo_adaptive_beta = float(args.slo_adaptive_beta)
+    _slo_adaptive_baseline_center = float(args.slo_adaptive_baseline_center)
 
     if args.cache_config_file:
         init_conf = init_similar_cache_from_config(config_dir=args.cache_config_file)
@@ -491,6 +550,7 @@ def main():
             args.cache_dir,
             config=Config(
                 context_cache_window_len=args.context_cache_window_len,
+                context_cache_window_min=args.context_cache_window_min,
                 load_adaptive=args.load_adaptive,
                 load_adaptive_ratio=args.load_adaptive_ratio,
                 load_adaptive_token_ratio=args.load_adaptive_token_ratio,
@@ -508,6 +568,7 @@ def main():
         )
         cache_dir = args.cache_dir
     cache.config.context_cache_window_len = args.context_cache_window_len
+    cache.config.context_cache_window_min = args.context_cache_window_min
     cache.config.load_adaptive = args.load_adaptive
     cache.config.load_adaptive_ratio = args.load_adaptive_ratio
     cache.config.load_adaptive_token_ratio = args.load_adaptive_token_ratio
@@ -542,6 +603,7 @@ def main():
                 cache_obj=openai_cache,
                 config=Config(
                     context_cache_window_len=args.context_cache_window_len,
+                    context_cache_window_min=args.context_cache_window_min,
                     load_adaptive=args.load_adaptive,
                     load_adaptive_ratio=args.load_adaptive_ratio,
                     load_adaptive_token_ratio=args.load_adaptive_token_ratio,
@@ -558,6 +620,7 @@ def main():
                 ),
             )
         openai_cache.config.context_cache_window_len = args.context_cache_window_len
+        openai_cache.config.context_cache_window_min = args.context_cache_window_min
         openai_cache.config.load_adaptive = args.load_adaptive
         openai_cache.config.load_adaptive_ratio = args.load_adaptive_ratio
         openai_cache.config.load_adaptive_token_ratio = args.load_adaptive_token_ratio
