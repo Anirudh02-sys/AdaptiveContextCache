@@ -8,6 +8,15 @@ Multithreaded request generator for application-grouped conversation files.
 Reads `application_*.jsonl`, spawns multiple threads per application, and sends
 requests to `/v1/chat/completions` while preserving history only within each
 conversation.
+
+`load_multiplier` scales **how many threads** run per application (config
+`threads_per_application` × `load_multiplier`, at least one thread per app). Per-thread
+pacing uses the configured delays unchanged; it does **not** divide sleep by LM.
+Compare against a nocache baseline only when the baseline was produced with the same
+effective thread layout (same LM), or accuracy keys may not line up.
+
+`load_multiplier_start_seconds` is kept in the config for compatibility but no longer
+changes pacing (thread count is fixed at process start from `load_multiplier`).
 """
 
 from __future__ import annotations
@@ -281,18 +290,13 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _current_load_multiplier(
-    target_lm: float, start_s: float, experiment_start_time: float
-) -> float:
-    # Before `start_s` seconds elapse from the experiment start, requests are paced
-    # as if load_multiplier=1.0 so the system has a stable baseline phase. After the
-    # threshold, the configured target multiplier takes over. A non-positive
-    # `start_s` disables the delay and the target applies from t=0 (back-compat).
-    if start_s <= 0:
-        return target_lm
-    if (time.time() - experiment_start_time) >= start_s:
-        return target_lm
-    return 1.0
+def _scaled_thread_count(base_threads: int, load_multiplier: float) -> int:
+    """Per-app thread count = base_threads × load_multiplier (minimum 1)."""
+    lm = float(load_multiplier)
+    if lm <= 0:
+        lm = 1.0
+    scaled = int(round(float(base_threads) * lm))
+    return max(1, scaled)
 
 
 class RunState:
@@ -401,20 +405,11 @@ def _thread_worker(
     conversations: Sequence[Dict[str, Any]],
     conversation_draw_count: int,
     experiment_end_time: Optional[float],
-    experiment_start_time: float,
     config: Dict[str, Any],
     state: RunState,
     log_path: str,
     log_lock: threading.Lock,
 ) -> None:
-    load_multiplier = _safe_float(config.get("load_multiplier", 1.0), default=1.0)
-    if load_multiplier <= 0:
-        load_multiplier = 1.0
-    lm_start_s = _safe_float(
-        config.get("load_multiplier_start_seconds", 0), default=0.0
-    )
-    if lm_start_s < 0:
-        lm_start_s = 0.0
     default_delay_ms = int(config.get("default_delay_ms", 150))
     app_delay_ms = int(config.get("app_delay_ms", {}).get(str(app_id), default_delay_ms))
     jitter_ms = int(config.get("thread_jitter_ms", 40))
@@ -575,16 +570,10 @@ def _thread_worker(
                     with open(log_path, "a", encoding="utf-8") as f:
                         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-            # Global multiplier accelerates/decelerates pacing across all apps.
-            # Example: load_multiplier=2.0 -> roughly half sleep duration -> ~2x load.
-            # When `load_multiplier_start_seconds` > 0, LM stays at 1.0 until that
-            # many seconds have elapsed since the experiment started, then switches
-            # to the configured target — evaluated per turn so the switch is live.
+            # Inter-request pacing (load_multiplier does not shorten sleep; it scales
+            # thread count in `run()` instead).
             raw_delay_s = (app_delay_ms + thread_rng.randint(0, max(0, jitter_ms))) / 1000.0
-            effective_lm = _current_load_multiplier(
-                load_multiplier, lm_start_s, experiment_start_time
-            )
-            delay_s = raw_delay_s / effective_lm
+            delay_s = raw_delay_s
             if experiment_end_time is not None:
                 remaining_s = experiment_end_time - time.time()
                 if remaining_s <= 0:
@@ -950,40 +939,59 @@ def run(config: Dict[str, Any]) -> Dict[str, Any]:
     else:
         config["_accuracy_baseline_map"] = None
 
+    load_mult = _safe_float(config.get("load_multiplier", 1.0), default=1.0)
+    if load_mult <= 0:
+        load_mult = 1.0
+    if baseline_path and abs(load_mult - 1.0) > 1e-9:
+        print(
+            "[accuracy] note: accuracy_baseline_log_path is set and load_multiplier != 1.0. "
+            "Baseline keys are (app, thread_id, conv, turn); use the same load_multiplier "
+            "when recording the baseline or comparisons may be sparse.",
+            flush=True,
+        )
+
     state = RunState()
     experiment_end_time = (
         state.started_at + experiment_duration_s if experiment_duration_s > 0 else None
     )
     futures = []
-    total_threads = 0
-    with ThreadPoolExecutor(max_workers=int(config.get("max_workers", 64))) as executor:
-        for app_id in sorted(app_records.keys()):
-            app_convs = app_records[app_id]
-            if max_conversations > 0:
-                app_convs = app_convs[:max_conversations]
-            thread_count = int(thread_overrides.get(str(app_id), default_threads))
-            thread_count = max(1, thread_count)
-            split = _split_for_threads(app_convs, thread_count)
-            for thread_idx, shard in enumerate(split):
-                conversation_draw_count = len(shard)
-                if conversation_draw_count <= 0:
-                    continue
-                total_threads += 1
-                futures.append(
-                    executor.submit(
-                        _thread_worker,
-                        app_id,
-                        thread_idx,
-                        app_convs,
-                        conversation_draw_count,
-                        experiment_end_time,
-                        state.started_at,
-                        config,
-                        state,
-                        log_path,
-                        log_lock,
-                    )
+    threads_per_app_effective: Dict[str, int] = {}
+    worker_jobs: List[Tuple[int, int, List[Dict[str, Any]], int]] = []
+    for app_id in sorted(app_records.keys()):
+        app_convs = app_records[app_id]
+        if max_conversations > 0:
+            app_convs = app_convs[:max_conversations]
+        base_threads = int(thread_overrides.get(str(app_id), default_threads))
+        base_threads = max(1, base_threads)
+        scaled_threads = _scaled_thread_count(base_threads, load_mult)
+        threads_per_app_effective[str(app_id)] = scaled_threads
+        split = _split_for_threads(app_convs, scaled_threads)
+        for thread_idx, shard in enumerate(split):
+            conversation_draw_count = len(shard)
+            if conversation_draw_count <= 0:
+                continue
+            worker_jobs.append((app_id, thread_idx, app_convs, conversation_draw_count))
+
+    max_workers_cfg = int(config.get("max_workers", 64))
+    pool_size = max(max_workers_cfg, len(worker_jobs))
+    total_threads = len(worker_jobs)
+
+    with ThreadPoolExecutor(max_workers=pool_size) as executor:
+        for app_id, thread_idx, app_convs, conversation_draw_count in worker_jobs:
+            futures.append(
+                executor.submit(
+                    _thread_worker,
+                    app_id,
+                    thread_idx,
+                    app_convs,
+                    conversation_draw_count,
+                    experiment_end_time,
+                    config,
+                    state,
+                    log_path,
+                    log_lock,
                 )
+            )
         for fut in as_completed(futures):
             fut.result()
 
@@ -1089,11 +1097,13 @@ def run(config: Dict[str, Any]) -> Dict[str, Any]:
             ),
         },
         "load_multiplier": _safe_float(config.get("load_multiplier", 1.0), default=1.0),
+        "load_multiplier_scales": "threads_per_application",
         "load_multiplier_start_seconds": _safe_float(
             config.get("load_multiplier_start_seconds", 0), default=0.0
         ),
         "experiment_duration_seconds": round(experiment_duration_s, 3),
         "time_limited_run": bool(experiment_end_time is not None),
+        "threads_per_application_effective": threads_per_app_effective,
         "threads_spawned": total_threads,
         "applications_seen": sorted(list(app_records.keys())),
         "requests_sent": state.request_count,
