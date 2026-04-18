@@ -367,8 +367,18 @@ def main():
         default=2.0,
         metavar="R",
         help=(
-            "multiplicative load factor R>1 vs previous minute: shrink when load >= R×; "
-            "grow when load <= 1/R× (default: 2.0)."
+            "multiplicative load factor R>1 for request counts vs previous minute: "
+            "shrink when load >= R×; grow when load <= 1/R× (default: 2.0)."
+        ),
+    )
+    parser.add_argument(
+        "--load-adaptive-token-ratio",
+        type=float,
+        default=4.0,
+        metavar="R_TOK",
+        help=(
+            "stricter factor R_TOK>1 for total input-token counts (minute-over-minute). "
+            "Must exceed moderate token noise; default 4.0."
         ),
     )
     parser.add_argument(
@@ -404,6 +414,25 @@ def main():
         ),
     )
     parser.add_argument(
+        "--load-adaptive-spike-bypass-min-prev-req",
+        type=float,
+        default=0.0,
+        metavar="N",
+        help=(
+            "when shrink_min_rps would veto a ratio spike, still shrink if prev_req>=N "
+            "and curr_req>=R×prev_req. 0 disables (default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--load-adaptive-spike-bypass-min-prev-tok",
+        type=float,
+        default=0.0,
+        metavar="T",
+        help=(
+            "same for token spike bypass using load-adaptive-token-ratio. 0 disables."
+        ),
+    )
+    parser.add_argument(
         "--slo-adaptive",
         action="store_true",
         help="enable SLO-adaptive aspect (adaptivecontextcache; no-op until implemented).",
@@ -429,12 +458,18 @@ def main():
     args = parser.parse_args()
     if args.load_adaptive_ratio <= 1.0:
         parser.error("--load-adaptive-ratio must be > 1.0")
+    if args.load_adaptive_token_ratio <= 1.0:
+        parser.error("--load-adaptive-token-ratio must be > 1.0")
     if args.load_adaptive_shrink_min_rps < 0:
         parser.error("--load-adaptive-shrink-min-rps must be >= 0")
     if args.load_adaptive_grow_max_rps < 0:
         parser.error("--load-adaptive-grow-max-rps must be >= 0")
     if args.load_adaptive_force_shrink_rps < 0:
         parser.error("--load-adaptive-force-shrink-rps must be >= 0")
+    if args.load_adaptive_spike_bypass_min_prev_req < 0:
+        parser.error("--load-adaptive-spike-bypass-min-prev-req must be >= 0")
+    if args.load_adaptive_spike_bypass_min_prev_tok < 0:
+        parser.error("--load-adaptive-spike-bypass-min-prev-tok must be >= 0")
 
     # Surface gptcache INFO logs (e.g., load_adaptive shrink/grow events) on the server's
     # stderr alongside uvicorn's own logs so experiments can audit window transitions.
@@ -458,9 +493,16 @@ def main():
                 context_cache_window_len=args.context_cache_window_len,
                 load_adaptive=args.load_adaptive,
                 load_adaptive_ratio=args.load_adaptive_ratio,
+                load_adaptive_token_ratio=args.load_adaptive_token_ratio,
                 load_adaptive_shrink_min_rps=args.load_adaptive_shrink_min_rps,
                 load_adaptive_grow_max_rps=args.load_adaptive_grow_max_rps,
                 load_adaptive_force_shrink_rps=args.load_adaptive_force_shrink_rps,
+                load_adaptive_shrink_spike_bypass_min_prev_req=(
+                    args.load_adaptive_spike_bypass_min_prev_req
+                ),
+                load_adaptive_shrink_spike_bypass_min_prev_tok=(
+                    args.load_adaptive_spike_bypass_min_prev_tok
+                ),
                 slo_adaptive=args.slo_adaptive,
             ),
         )
@@ -468,9 +510,16 @@ def main():
     cache.config.context_cache_window_len = args.context_cache_window_len
     cache.config.load_adaptive = args.load_adaptive
     cache.config.load_adaptive_ratio = args.load_adaptive_ratio
+    cache.config.load_adaptive_token_ratio = args.load_adaptive_token_ratio
     cache.config.load_adaptive_shrink_min_rps = args.load_adaptive_shrink_min_rps
     cache.config.load_adaptive_grow_max_rps = args.load_adaptive_grow_max_rps
     cache.config.load_adaptive_force_shrink_rps = args.load_adaptive_force_shrink_rps
+    cache.config.load_adaptive_shrink_spike_bypass_min_prev_req = (
+        args.load_adaptive_spike_bypass_min_prev_req
+    )
+    cache.config.load_adaptive_shrink_spike_bypass_min_prev_tok = (
+        args.load_adaptive_spike_bypass_min_prev_tok
+    )
     cache.config.slo_adaptive = args.slo_adaptive
     cache_file_key = args.cache_file_key
     server_mode = args.server_mode
@@ -495,18 +544,32 @@ def main():
                     context_cache_window_len=args.context_cache_window_len,
                     load_adaptive=args.load_adaptive,
                     load_adaptive_ratio=args.load_adaptive_ratio,
+                    load_adaptive_token_ratio=args.load_adaptive_token_ratio,
                     load_adaptive_shrink_min_rps=args.load_adaptive_shrink_min_rps,
                     load_adaptive_grow_max_rps=args.load_adaptive_grow_max_rps,
                     load_adaptive_force_shrink_rps=args.load_adaptive_force_shrink_rps,
+                    load_adaptive_shrink_spike_bypass_min_prev_req=(
+                        args.load_adaptive_spike_bypass_min_prev_req
+                    ),
+                    load_adaptive_shrink_spike_bypass_min_prev_tok=(
+                        args.load_adaptive_spike_bypass_min_prev_tok
+                    ),
                     slo_adaptive=args.slo_adaptive,
                 ),
             )
         openai_cache.config.context_cache_window_len = args.context_cache_window_len
         openai_cache.config.load_adaptive = args.load_adaptive
         openai_cache.config.load_adaptive_ratio = args.load_adaptive_ratio
+        openai_cache.config.load_adaptive_token_ratio = args.load_adaptive_token_ratio
         openai_cache.config.load_adaptive_shrink_min_rps = args.load_adaptive_shrink_min_rps
         openai_cache.config.load_adaptive_grow_max_rps = args.load_adaptive_grow_max_rps
         openai_cache.config.load_adaptive_force_shrink_rps = args.load_adaptive_force_shrink_rps
+        openai_cache.config.load_adaptive_shrink_spike_bypass_min_prev_req = (
+            args.load_adaptive_spike_bypass_min_prev_req
+        )
+        openai_cache.config.load_adaptive_shrink_spike_bypass_min_prev_tok = (
+            args.load_adaptive_spike_bypass_min_prev_tok
+        )
         openai_cache.config.slo_adaptive = args.slo_adaptive
 
         import_starlette()

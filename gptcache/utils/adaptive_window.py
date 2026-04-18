@@ -51,7 +51,7 @@ class LoadAdaptiveMinuteWindow:
 
 
 class LoadAdaptiveContextController:
-    """Minute load counters + compare adjacent minutes (2× / ½×) to adjust ``context_cache_overall_factor``."""
+    """Minute load counters + compare adjacent minutes (R× / 1/R×) to adjust ``context_cache_overall_factor``."""
 
     __slots__ = ("_cache", "_window", "_ctrl_lock", "_eval_anchor", "_prev_req", "_prev_tok")
 
@@ -91,18 +91,22 @@ class LoadAdaptiveContextController:
             return
         w_max = int(cfg.context_cache_window_max)
         w = cfg.effective_context_window_len(None)
-        ratio = float(cfg.load_adaptive_ratio)
+        ratio_req = float(cfg.load_adaptive_ratio)
+        ratio_tok = float(getattr(cfg, "load_adaptive_token_ratio", ratio_req))
+        if ratio_tok <= 1.0:
+            ratio_tok = ratio_req
+
         high_load = False
         low_load = False
         if prev_req > 0:
-            if curr_req >= ratio * prev_req:
+            if curr_req >= ratio_req * prev_req:
                 high_load = True
-            elif curr_req <= prev_req / ratio:
+            elif curr_req <= prev_req / ratio_req:
                 low_load = True
         if prev_tok > 0:
-            if curr_tok >= ratio * prev_tok:
+            if curr_tok >= ratio_tok * prev_tok:
                 high_load = True
-            elif curr_tok <= prev_tok / ratio:
+            elif curr_tok <= prev_tok / ratio_tok:
                 low_load = True
 
         window_s = self._window.window_seconds
@@ -110,19 +114,50 @@ class LoadAdaptiveContextController:
         shrink_min_rps = float(getattr(cfg, "load_adaptive_shrink_min_rps", 0.0))
         grow_max_rps = float(getattr(cfg, "load_adaptive_grow_max_rps", 0.0))
         force_shrink_rps = float(getattr(cfg, "load_adaptive_force_shrink_rps", 0.0))
+        bypass_min_req = float(
+            getattr(cfg, "load_adaptive_shrink_spike_bypass_min_prev_req", 0.0)
+        )
+        bypass_min_tok = float(
+            getattr(cfg, "load_adaptive_shrink_spike_bypass_min_prev_tok", 0.0)
+        )
+
         if high_load and shrink_min_rps > 0.0 and curr_rps < shrink_min_rps:
-            _logger.info(
-                "load_adaptive: ratio spike suppressed (curr_rps=%.3f < shrink_min=%.3f); "
-                "req %s→%s, tok %s→%s; effective window stays %s",
-                curr_rps,
-                shrink_min_rps,
-                prev_req,
-                curr_req,
-                prev_tok,
-                curr_tok,
-                w,
+            strong_req_spike = (
+                bypass_min_req > 0.0
+                and prev_req >= bypass_min_req
+                and curr_req >= ratio_req * prev_req
             )
-            high_load = False
+            strong_tok_spike = (
+                bypass_min_tok > 0.0
+                and prev_tok >= bypass_min_tok
+                and curr_tok >= ratio_tok * prev_tok
+            )
+            if strong_req_spike or strong_tok_spike:
+                _logger.info(
+                    "load_adaptive: shrink_min bypass (strong spike; curr_rps=%.3f < shrink_min=%.3f); "
+                    "req %s→%s, tok %s→%s; keeping high_load (req_R=%.3g tok_R=%.3g)",
+                    curr_rps,
+                    shrink_min_rps,
+                    prev_req,
+                    curr_req,
+                    prev_tok,
+                    curr_tok,
+                    ratio_req,
+                    ratio_tok,
+                )
+            else:
+                _logger.info(
+                    "load_adaptive: ratio spike suppressed (curr_rps=%.3f < shrink_min=%.3f); "
+                    "req %s→%s, tok %s→%s; effective window stays %s",
+                    curr_rps,
+                    shrink_min_rps,
+                    prev_req,
+                    curr_req,
+                    prev_tok,
+                    curr_tok,
+                    w,
+                )
+                high_load = False
         if low_load and grow_max_rps > 0.0 and curr_rps > grow_max_rps:
             _logger.info(
                 "load_adaptive: ratio drop suppressed (curr_rps=%.3f > grow_max=%.3f); "
@@ -163,9 +198,10 @@ class LoadAdaptiveContextController:
             if new_w != w:
                 cfg.context_cache_overall_factor = new_w / float(n)
                 _logger.info(
-                    "load_adaptive: load >= %.3g× previous minute (req %s→%s, tok %s→%s); "
-                    "effective window %s → %s (overall_factor=%.6g)",
-                    ratio,
+                    "load_adaptive: high load vs previous minute (req_R=%.3g tok_R=%.3g; "
+                    "req %s→%s, tok %s→%s); effective window %s → %s (overall_factor=%.6g)",
+                    ratio_req,
+                    ratio_tok,
                     prev_req,
                     curr_req,
                     prev_tok,
@@ -180,9 +216,10 @@ class LoadAdaptiveContextController:
             if new_w != w:
                 cfg.context_cache_overall_factor = new_w / float(n)
                 _logger.info(
-                    "load_adaptive: load <= 1/%.3g× previous minute (req %s→%s, tok %s→%s); "
-                    "effective window %s → %s (overall_factor=%.6g)",
-                    ratio,
+                    "load_adaptive: low load vs previous minute (req_R=%.3g tok_R=%.3g; "
+                    "req %s→%s, tok %s→%s); effective window %s → %s (overall_factor=%.6g)",
+                    ratio_req,
+                    ratio_tok,
                     prev_req,
                     curr_req,
                     prev_tok,

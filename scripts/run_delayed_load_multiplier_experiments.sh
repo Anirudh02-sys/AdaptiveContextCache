@@ -70,25 +70,9 @@ DRY_RUN="${DRY_RUN:-no}"
 CACHE_DIR="${CACHE_DIR:-/tmp/contextcache_data_load_mult_delayed}"
 EXAMPLE_CONFIG="${EXAMPLE_CONFIG:-config/request_gen.example.json}"
 LOAD_ADAPTIVE_RATIO="${LOAD_ADAPTIVE_RATIO:-2.0}"
+LOAD_ADAPTIVE_TOKEN_RATIO="${LOAD_ADAPTIVE_TOKEN_RATIO:-4.0}"
 LOAD_MULT="${LOAD_MULT:-10}"
 LOAD_MULT_START_S="${LOAD_MULT_START_S:-240}"
-
-# Workload characteristics (threads_per_application, app_delay_ms, etc.) come from
-# EXAMPLE_CONFIG unchanged. With the current request_gen.example.json (7 threads across
-# 5 apps with per-app delays 1600/4500/2800/1400/3800 ms), offered rates are
-# ~3.52 req/s at LM=1 and ~35.2 req/s at LM=10.
-
-# Load-adaptive controller thresholds. `curr_rps` at the cache is thread-bottlenecked by
-# upstream server latency (threads sleep AFTER each call), so arrival rates are below the
-# offered rates: LM=1 lands in ~2.25-3.52 rps, LM=10 in ~5.7-35 rps. The 4.0 rps gate
-# below sits in the separation band, firing force-shrink only after the delayed switch
-# to LM=10 while leaving the pre-switch LM=1 window untouched at the base size.
-LOAD_ADAPTIVE_SHRINK_MIN_RPS="${LOAD_ADAPTIVE_SHRINK_MIN_RPS:-4.0}"
-LOAD_ADAPTIVE_FORCE_SHRINK_RPS="${LOAD_ADAPTIVE_FORCE_SHRINK_RPS:-4.0}"
-# Growth ceiling: a grow step is gated by curr_rps <= this value. LM=1's floor is
-# ~2.25 rps (well above 1.0), so warmup->steady ratio drops during the LM=1 phase
-# never grow the window.
-LOAD_ADAPTIVE_GROW_MAX_RPS="${LOAD_ADAPTIVE_GROW_MAX_RPS:-1.0}"
 
 # This sweep intentionally does NOT override experiment_duration_seconds,
 # max_turns_per_conversation, or max_conversations_per_app — they come from
@@ -141,6 +125,15 @@ wait_for_server() {
     fi
     sleep 1
   done
+}
+
+append_if_set() {
+  local -n out_ref="$1"
+  local flag="$2"
+  local value="${3-}"
+  if [[ -n "${value}" ]]; then
+    out_ref+=("${flag}" "${value}")
+  fi
 }
 
 run_experiment() {
@@ -259,12 +252,12 @@ if should_run "contextcache"; then
   run_experiment "contextcache" "contextcache"
 fi
 if should_run "adaptive_load"; then
-  run_experiment "adaptivecontextcache" "adaptive_load" \
-    --load-adaptive \
-    --load-adaptive-ratio "${LOAD_ADAPTIVE_RATIO}" \
-    --load-adaptive-shrink-min-rps "${LOAD_ADAPTIVE_SHRINK_MIN_RPS}" \
-    --load-adaptive-force-shrink-rps "${LOAD_ADAPTIVE_FORCE_SHRINK_RPS}" \
-    --load-adaptive-grow-max-rps "${LOAD_ADAPTIVE_GROW_MAX_RPS}"
+  adaptive_args=(
+    --load-adaptive
+    --load-adaptive-ratio "${LOAD_ADAPTIVE_RATIO}"
+    --load-adaptive-token-ratio "${LOAD_ADAPTIVE_TOKEN_RATIO}"
+  )
+  run_experiment "adaptivecontextcache" "adaptive_load" "${adaptive_args[@]}"
 fi
 
 compare_dir="${PLOTS_ROOT}/compare_${LM_TAG}"

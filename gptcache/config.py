@@ -35,8 +35,10 @@ class Config:
     :type context_cache_window_max: int
     :param load_adaptive: adaptivecontextcache: load-aware adaptation (minute counters + optional context window scaling).
     :type load_adaptive: bool
-    :param load_adaptive_ratio: R > 1: shrink window when load >= R× previous minute; grow when load <= previous/R.
+    :param load_adaptive_ratio: R > 1: for **request** counts, shrink when load >= R× previous minute; grow when load <= previous/R.
     :type load_adaptive_ratio: float
+    :param load_adaptive_token_ratio: R_tok > 1: same multiplicative rule for **token** totals; use R_tok >> R to require a larger relative token swing before tokens affect high/low load (default 4.0).
+    :type load_adaptive_token_ratio: float
     :param load_adaptive_shrink_min_rps: absolute current-window request-rate floor (req/s). When > 0,
         a shrink only fires if the current-window rate is >= this value. Prevents the warmup→steady-state
         ramp from triggering false shrinks at low absolute loads. 0 disables the gate (ratio only).
@@ -49,6 +51,11 @@ class Config:
         this value, regardless of the ratio check. Lets the controller cascade shrinks under
         sustained overload even when traffic has already plateaued above the server's capacity.
     :type load_adaptive_force_shrink_rps: float
+    :param load_adaptive_shrink_spike_bypass_min_prev_req: when ``shrink_min_rps`` would veto a ratio spike,
+        still shrink if ``prev_req`` is at least this many requests **and** ``curr_req >= R×prev_req``. 0 disables.
+    :type load_adaptive_shrink_spike_bypass_min_prev_req: float
+    :param load_adaptive_shrink_spike_bypass_min_prev_tok: same for token spike bypass using ``R_tok``. 0 disables.
+    :type load_adaptive_shrink_spike_bypass_min_prev_tok: float
     :param slo_adaptive: adaptivecontextcache: SLO-aware adaptation (reserved; currently no-op).
     :type slo_adaptive: bool
 
@@ -83,9 +90,12 @@ class Config:
             context_cache_window_max: int = 32,
             load_adaptive: bool = False,
             load_adaptive_ratio: float = 2.0,
-            load_adaptive_shrink_min_rps: float = 0.0,
-            load_adaptive_grow_max_rps: float = 0.0,
-            load_adaptive_force_shrink_rps: float = 0.0,
+            load_adaptive_token_ratio: float = 4.0,
+            load_adaptive_shrink_min_rps: float = 2.5,
+            load_adaptive_grow_max_rps: float = 1.0,
+            load_adaptive_force_shrink_rps: float = 2.75,
+            load_adaptive_shrink_spike_bypass_min_prev_req: float = 12.0,
+            load_adaptive_shrink_spike_bypass_min_prev_tok: float = 0.0,
             slo_adaptive: bool = False,
     ):
         if similarity_threshold < 0 or similarity_threshold > 1:
@@ -131,6 +141,10 @@ class Config:
             raise CacheError(
                 "load_adaptive_ratio must be > 1.0"
             )
+        if load_adaptive_token_ratio <= 1.0:
+            raise CacheError(
+                "load_adaptive_token_ratio must be > 1.0"
+            )
         if load_adaptive_shrink_min_rps < 0:
             raise CacheError(
                 "load_adaptive_shrink_min_rps must be >= 0 (0 disables)"
@@ -142,6 +156,14 @@ class Config:
         if load_adaptive_force_shrink_rps < 0:
             raise CacheError(
                 "load_adaptive_force_shrink_rps must be >= 0 (0 disables)"
+            )
+        if load_adaptive_shrink_spike_bypass_min_prev_req < 0:
+            raise CacheError(
+                "load_adaptive_shrink_spike_bypass_min_prev_req must be >= 0 (0 disables)"
+            )
+        if load_adaptive_shrink_spike_bypass_min_prev_tok < 0:
+            raise CacheError(
+                "load_adaptive_shrink_spike_bypass_min_prev_tok must be >= 0 (0 disables)"
             )
         self.log_time_func = log_time_func
         self.similarity_threshold = similarity_threshold
@@ -168,9 +190,16 @@ class Config:
         self.context_cache_window_max = context_cache_window_max
         self.load_adaptive = load_adaptive
         self.load_adaptive_ratio = float(load_adaptive_ratio)
+        self.load_adaptive_token_ratio = float(load_adaptive_token_ratio)
         self.load_adaptive_shrink_min_rps = float(load_adaptive_shrink_min_rps)
         self.load_adaptive_grow_max_rps = float(load_adaptive_grow_max_rps)
         self.load_adaptive_force_shrink_rps = float(load_adaptive_force_shrink_rps)
+        self.load_adaptive_shrink_spike_bypass_min_prev_req = float(
+            load_adaptive_shrink_spike_bypass_min_prev_req
+        )
+        self.load_adaptive_shrink_spike_bypass_min_prev_tok = float(
+            load_adaptive_shrink_spike_bypass_min_prev_tok
+        )
         self.slo_adaptive = slo_adaptive
         self.context_emb = None
         self.cur_id = 0

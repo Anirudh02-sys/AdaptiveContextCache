@@ -179,9 +179,10 @@ run_experiment() {
 }
 
 # Baseline experiments (uncomment when you want to regenerate nocache / gptcache / contextcache metrics):
+# Temporarily skipped to save time; uncomment to regenerate nocache / gptcache metrics.
 # run_experiment "no-cache" "nocache"
 # run_experiment "gptcache" "gptcache"
-# run_experiment "contextcache" "contextcache"
+run_experiment "contextcache" "contextcache"
 
 # SLO-adaptive context cache: adaptivecontextcache + --slo-adaptive (see gptcache_server --help).
 run_experiment "adaptivecontextcache" "adaptive_slo" --slo-adaptive

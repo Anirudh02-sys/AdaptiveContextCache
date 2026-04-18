@@ -14,9 +14,7 @@
 # Layout:
 #   data/test_apps/load_mult_compare/lm1|lm10/request_metrics_<suffix>.json
 #   data/test_apps/load_mult_compare/plots/lm1|lm10/<suffix>/   (per-run plots)
-#   data/test_apps/load_mult_compare/plots/compare_all/         (8-way compare, both loads)
-#   data/test_apps/load_mult_compare/plots/compare_lm1/         (4 runs, LM=1 only)
-#   data/test_apps/load_mult_compare/plots/compare_lm10/        (4 runs, LM=10 only)
+#   data/test_apps/load_mult_compare/plots/compare_avg_all/     (app-averaged bars across selected runs)
 #
 # Usage:
 #   ./scripts/run_load_multiplier_experiments.sh
@@ -26,7 +24,7 @@
 #   PYTHON              Python interpreter (default: .venv/bin/python or python3)
 #   DRY_RUN             yes|no — server upstream dry-run (default: no)
 #   CACHE_DIR           Server cache directory cleared each run (default: /tmp/contextcache_data_load_mult)
-#   LOAD_ADAPTIVE_RATIO Passed to --load-adaptive-ratio (default: 2.0, must be > 1)
+#   LOAD_ADAPTIVE_RATIO Passed through to the server for adaptive runs.
 #   EXAMPLE_CONFIG      Request-gen template (default: config/request_gen.example.json)
 #
 set -euo pipefail
@@ -72,17 +70,7 @@ LOAD_ADAPTIVE_RATIO="${LOAD_ADAPTIVE_RATIO:-2.0}"
 # 5 apps with per-app delays 1600/4500/2800/1400/3800 ms), offered rates are
 # ~3.52 req/s at LM=1 and ~35.2 req/s at LM=10.
 
-# Load-adaptive controller thresholds. `curr_rps` at the cache is thread-bottlenecked by
-# upstream server latency (threads sleep AFTER each call), so arrival rates are below the
-# offered rates: LM=1 lands in ~2.25-3.52 rps, LM=10 in ~5.7-35 rps. The 4.0 rps gate
-# below sits in the separation band, firing force-shrink only at LM=10 while leaving the
-# LM=1 window untouched at the base size.
-LOAD_ADAPTIVE_SHRINK_MIN_RPS="${LOAD_ADAPTIVE_SHRINK_MIN_RPS:-4.0}"
-LOAD_ADAPTIVE_FORCE_SHRINK_RPS="${LOAD_ADAPTIVE_FORCE_SHRINK_RPS:-4.0}"
-# Growth ceiling: a grow step is gated by curr_rps <= this value. LM=1's floor is
-# ~2.25 rps (well above 1.0), so warmup->steady ratio drops at LM=1 never grow the window.
-LOAD_ADAPTIVE_GROW_MAX_RPS="${LOAD_ADAPTIVE_GROW_MAX_RPS:-1.0}"
-
+# Absolute req/s gates now come from config defaults rather than CLI flags.
 # Optional overrides to keep the 8-run sweep under tight time budgets. When set, they
 # override the corresponding fields in EXAMPLE_CONFIG for every run. Leave unset to use
 # whatever EXAMPLE_CONFIG already specifies.
@@ -134,6 +122,15 @@ wait_for_server() {
     fi
     sleep 1
   done
+}
+
+append_if_set() {
+  local -n out_ref="$1"
+  local flag="$2"
+  local value="${3-}"
+  if [[ -n "${value}" ]]; then
+    out_ref+=("${flag}" "${value}")
+  fi
 }
 
 run_experiment() {
@@ -252,75 +249,54 @@ should_run() {
   [[ " ${RUN_ONLY_SUFFIXES} " == *" ${want} "* ]]
 }
 
+append_compare_run_if_present() {
+  local -n args_ref="$1"
+  local key="$2"
+  local label="$3"
+  local metrics_path="$4"
+  if [[ -f "${metrics_path}" ]]; then
+    args_ref+=(--run "${key}:${metrics_path}" --label "${key}:${label}")
+  fi
+}
+
 for LOAD_MULT in 1 10; do
-  # TODO(re-enable): nocache baseline run (needed for accuracy comparisons and compare_all plot).
-  # if should_run "nocache"; then
-  #   run_experiment "${LOAD_MULT}" "no-cache" "nocache"
-  # fi
-  # TODO(re-enable): gptcache mode.
-  # if should_run "gptcache"; then
-  #   run_experiment "${LOAD_MULT}" "gptcache" "gptcache"
-  # fi
+  if should_run "nocache"; then
+    run_experiment "${LOAD_MULT}" "no-cache" "nocache"
+  fi
+  if should_run "gptcache"; then
+    run_experiment "${LOAD_MULT}" "gptcache" "gptcache"
+  fi
   if should_run "contextcache"; then
     run_experiment "${LOAD_MULT}" "contextcache" "contextcache"
   fi
   if should_run "adaptive_load"; then
-    run_experiment "${LOAD_MULT}" "adaptivecontextcache" "adaptive_load" \
-      --load-adaptive \
-      --load-adaptive-ratio "${LOAD_ADAPTIVE_RATIO}" \
-      --load-adaptive-shrink-min-rps "${LOAD_ADAPTIVE_SHRINK_MIN_RPS}" \
-      --load-adaptive-force-shrink-rps "${LOAD_ADAPTIVE_FORCE_SHRINK_RPS}" \
-      --load-adaptive-grow-max-rps "${LOAD_ADAPTIVE_GROW_MAX_RPS}"
+    adaptive_args=(--load-adaptive --load-adaptive-ratio "${LOAD_ADAPTIVE_RATIO}")
+    run_experiment "${LOAD_MULT}" "adaptivecontextcache" "adaptive_load" "${adaptive_args[@]}"
   fi
 done
 
-# TODO(re-enable): compare_all (8-run) plot — requires nocache and gptcache runs.
-# compare_all_dir="${PLOTS_ROOT}/compare_all"
-# mkdir -p "${compare_all_dir}"
-#
-# "${PYTHON_BIN}" scripts/compare_experiments.py \
-#   --run "nocache_lm1:${D_ABS}/lm1/request_metrics_nocache.json" \
-#   --label "nocache_lm1:no-cache (LM=1)" \
-#   --run "gptcache_lm1:${D_ABS}/lm1/request_metrics_gptcache.json" \
-#   --label "gptcache_lm1:gptcache (LM=1)" \
-#   --run "contextcache_lm1:${D_ABS}/lm1/request_metrics_contextcache.json" \
-#   --label "contextcache_lm1:contextcache (LM=1)" \
-#   --run "adaptive_load_lm1:${D_ABS}/lm1/request_metrics_adaptive_load.json" \
-#   --label "adaptive_load_lm1:adaptive context (load) (LM=1)" \
-#   --run "nocache_lm10:${D_ABS}/lm10/request_metrics_nocache.json" \
-#   --label "nocache_lm10:no-cache (LM=10)" \
-#   --run "gptcache_lm10:${D_ABS}/lm10/request_metrics_gptcache.json" \
-#   --label "gptcache_lm10:gptcache (LM=10)" \
-#   --run "contextcache_lm10:${D_ABS}/lm10/request_metrics_contextcache.json" \
-#   --label "contextcache_lm10:contextcache (LM=10)" \
-#   --run "adaptive_load_lm10:${D_ABS}/lm10/request_metrics_adaptive_load.json" \
-#   --label "adaptive_load_lm10:adaptive context (load) (LM=10)" \
-#   --output-dir "${compare_all_dir}" \
-#   --prefix "compare"
+compare_avg_all_dir="${PLOTS_ROOT}/compare_avg_all"
+mkdir -p "${compare_avg_all_dir}"
 
-compare_lm1_dir="${PLOTS_ROOT}/compare_lm1"
-mkdir -p "${compare_lm1_dir}"
+compare_args=()
+append_compare_run_if_present compare_args "nocache_lm1" "no-cache (LM=1)" "${D_ABS}/lm1/request_metrics_nocache.json"
+append_compare_run_if_present compare_args "nocache_lm10" "no-cache (LM=10)" "${D_ABS}/lm10/request_metrics_nocache.json"
+append_compare_run_if_present compare_args "gptcache_lm1" "gptcache (LM=1)" "${D_ABS}/lm1/request_metrics_gptcache.json"
+append_compare_run_if_present compare_args "gptcache_lm10" "gptcache (LM=10)" "${D_ABS}/lm10/request_metrics_gptcache.json"
+append_compare_run_if_present compare_args "contextcache_lm1" "contextcache (LM=1)" "${D_ABS}/lm1/request_metrics_contextcache.json"
+append_compare_run_if_present compare_args "adaptive_load_lm1" "adaptive context (LM=1)" "${D_ABS}/lm1/request_metrics_adaptive_load.json"
+append_compare_run_if_present compare_args "contextcache_lm10" "contextcache (LM=10)" "${D_ABS}/lm10/request_metrics_contextcache.json"
+append_compare_run_if_present compare_args "adaptive_load_lm10" "adaptive context (LM=10)" "${D_ABS}/lm10/request_metrics_adaptive_load.json"
 
-"${PYTHON_BIN}" scripts/compare_experiments.py \
-  `# TODO(re-enable): --run "nocache:${D_ABS}/lm1/request_metrics_nocache.json"` \
-  `# TODO(re-enable): --run "gptcache:${D_ABS}/lm1/request_metrics_gptcache.json"` \
-  --run "contextcache:${D_ABS}/lm1/request_metrics_contextcache.json" \
-  --run "adaptive_load:${D_ABS}/lm1/request_metrics_adaptive_load.json" \
-  --output-dir "${compare_lm1_dir}" \
-  --prefix "compare_lm1"
-
-compare_lm10_dir="${PLOTS_ROOT}/compare_lm10"
-mkdir -p "${compare_lm10_dir}"
-
-"${PYTHON_BIN}" scripts/compare_experiments.py \
-  `# TODO(re-enable): --run "nocache:${D_ABS}/lm10/request_metrics_nocache.json"` \
-  `# TODO(re-enable): --run "gptcache:${D_ABS}/lm10/request_metrics_gptcache.json"` \
-  --run "contextcache:${D_ABS}/lm10/request_metrics_contextcache.json" \
-  --run "adaptive_load:${D_ABS}/lm10/request_metrics_adaptive_load.json" \
-  --output-dir "${compare_lm10_dir}" \
-  --prefix "compare_lm10"
+if ((${#compare_args[@]} > 0)); then
+  "${PYTHON_BIN}" scripts/compare_experiments_avg.py \
+    "${compare_args[@]}" \
+    --output-dir "${compare_avg_all_dir}" \
+    --prefix "compare_avg_all"
+else
+  echo "Skipping averaged comparison plot: no metrics files found."
+fi
 
 echo "All load-multiplier experiments complete."
 echo "  Metrics/logs: ${DATA_ROOT}/lm1/ and ${DATA_ROOT}/lm10/"
-echo "  Compare LM=1:  ${compare_lm1_dir}"
-echo "  Compare LM=10: ${compare_lm10_dir}"
+echo "  Compare all:   ${compare_avg_all_dir}"
