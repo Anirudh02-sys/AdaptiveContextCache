@@ -11,6 +11,27 @@ from typing import Any, Deque, Tuple
 _logger = logging.getLogger(__name__)
 
 
+def _emit_load_window_update(
+    *,
+    trigger: str,
+    base_window: int,
+    window_min: int,
+    window_max: int,
+    old_effective: int,
+    new_effective: int,
+    old_overall: float,
+    new_overall: float,
+) -> None:
+    msg = (
+        f"window_update_global trigger={trigger} base_window={base_window} "
+        f"window_min={window_min} window_max={window_max} "
+        f"old_effective_window={old_effective} new_effective_window={new_effective} "
+        f"old_overall_factor={old_overall:.6g} new_overall_factor={new_overall:.6g}"
+    )
+    print(msg, flush=True)
+    _logger.info(msg)
+
+
 class LoadAdaptiveMinuteWindow:
     """Track request count and token count over the last ``window_seconds`` (default 60s)."""
 
@@ -197,6 +218,7 @@ class LoadAdaptiveContextController:
         if high_load:
             new_w = max(w_min, w - 1)
             if new_w != w:
+                old_overall = float(cfg.context_cache_overall_factor)
                 cfg.context_cache_overall_factor = new_w / float(n)
                 _logger.info(
                     "load_adaptive: high load vs previous minute (req_R=%.3g tok_R=%.3g; "
@@ -211,10 +233,21 @@ class LoadAdaptiveContextController:
                     new_w,
                     cfg.context_cache_overall_factor,
                 )
+                _emit_load_window_update(
+                    trigger="load_high",
+                    base_window=n,
+                    window_min=w_min,
+                    window_max=w_max,
+                    old_effective=w,
+                    new_effective=new_w,
+                    old_overall=old_overall,
+                    new_overall=float(cfg.context_cache_overall_factor),
+                )
             return
         if low_load:
             new_w = min(w_max, w + 1)
             if new_w != w:
+                old_overall = float(cfg.context_cache_overall_factor)
                 cfg.context_cache_overall_factor = new_w / float(n)
                 _logger.info(
                     "load_adaptive: low load vs previous minute (req_R=%.3g tok_R=%.3g; "
@@ -228,4 +261,14 @@ class LoadAdaptiveContextController:
                     w,
                     new_w,
                     cfg.context_cache_overall_factor,
+                )
+                _emit_load_window_update(
+                    trigger="load_low",
+                    base_window=n,
+                    window_min=w_min,
+                    window_max=w_max,
+                    old_effective=w,
+                    new_effective=new_w,
+                    old_overall=old_overall,
+                    new_overall=float(cfg.context_cache_overall_factor),
                 )
