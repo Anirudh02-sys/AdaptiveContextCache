@@ -97,7 +97,11 @@ curl -s http://127.0.0.1:8011/
 6) Download dataset
 --------------------------------------------------
 
-Download the dataset from https://drive.google.com/drive/u/1/folders/10Oo-17nqrvMcHVdhUfLaMV_DI5yOkb2a and place it inside the AdaptiveContextCache folder.
+Download the dataset from https://drive.google.com/drive/u/1/folders/10Oo-17nqrvMcHVdhUfLaMV_DI5yOkb2a and place it inside the AdaptiveContextCache folder. It should be placed such that the path is {ROOT_DIR}/AdaptiveContextCache/data.
+
+Move the chosen warmup files among those in the data folder to the correct data_dir folder mentioned in the config in {ROOT_DIR}/AdaptiveContextCache/config/request_gen.example.json
+
+For our experiment, we moved {ROOT_DIR}/AdaptiveContextCache/data/mt1010_warmup_50.jsonl to {ROOT_DIR}/AdaptiveContextCache/data/mt10_50_5_apps/ and set the config parameters accordingly.
 
 
 
