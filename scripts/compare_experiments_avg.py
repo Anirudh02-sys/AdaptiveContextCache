@@ -4,6 +4,9 @@ Compare experiment latency and accuracy using per-application averages.
 
 This keeps the CLI shape of ``compare_experiments.py`` but aggregates each run
 down to a single bar per metric by averaging across applications.
+
+Also writes ``{prefix}_avg_metrics_row.png``: one row (accuracy, then latency) with the
+same charts as the standalone PNGs, for a single combined figure.
 """
 
 from __future__ import annotations
@@ -13,6 +16,8 @@ import json
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from matplotlib.axes import Axes
 
 import matplotlib
 
@@ -359,16 +364,7 @@ def _bar_plot(
     return _save(fig, output_dir, filename)
 
 
-def _grouped_bar_plot_by_baseline(
-    runs: Sequence[ExperimentRun],
-    value_by_key: Dict[str, float],
-    title: str,
-    ylabel: str,
-    output_dir: str,
-    filename: str,
-    load_multipliers: Sequence[int] = (1, 10),
-) -> str:
-    # Preserve baseline order as provided (runs were constructed in suffix order).
+def _grouped_bar_baselines(runs: Sequence[ExperimentRun]) -> List[str]:
     baselines: List[str] = []
     seen = set()
     for r in runs:
@@ -376,27 +372,40 @@ def _grouped_bar_plot_by_baseline(
         if b not in seen:
             baselines.append(b)
             seen.add(b)
+    return baselines
 
+
+def _grouped_bar_geometry(
+    baselines: Sequence[str], load_multipliers: Sequence[int]
+) -> Tuple[List[int], List[int], float, float, Dict[str, Any], Dict[int, Dict[str, Any]]]:
     lm_list = [int(x) for x in load_multipliers]
     series_count = len(lm_list)
     group_x = list(range(len(baselines)))
     group_width = 0.76
     bar_w = group_width / max(1, series_count)
-
-    # One distinct color per baseline; LM variants use hatch/alpha.
     cmap = plt.get_cmap("tab10")
-    baseline_color: Dict[str, Any] = {
-        b: cmap(i % 10) for i, b in enumerate(baselines)
-    }
-
-    fig_width = max(10.5, 1.7 * len(baselines))
-    fig, ax = plt.subplots(figsize=(fig_width, 5.8))
-
+    baseline_color: Dict[str, Any] = {b: cmap(i % 10) for i, b in enumerate(baselines)}
     lm_styles = {
         lm_list[0]: {"alpha": 0.75, "hatch": ""},
         lm_list[1] if len(lm_list) > 1 else lm_list[0]: {"alpha": 1.0, "hatch": "//"},
     }
+    return lm_list, group_x, group_width, bar_w, baseline_color, lm_styles
 
+
+def _draw_grouped_bars_on_ax(
+    ax: Axes,
+    baselines: Sequence[str],
+    value_by_key: Dict[str, float],
+    title: str,
+    ylabel: str,
+    load_multipliers: Sequence[int] = (1, 10),
+    *,
+    show_legend: bool = True,
+    value_fontsize: float = 8.5,
+) -> None:
+    lm_list, group_x, group_width, bar_w, baseline_color, lm_styles = _grouped_bar_geometry(
+        baselines, load_multipliers
+    )
     for j, lm in enumerate(lm_list):
         offsets = [gx - (group_width / 2.0) + (j + 0.5) * bar_w for gx in group_x]
         vals = []
@@ -422,18 +431,144 @@ def _grouped_bar_plot_by_baseline(
                 f"{v:.3f}" if abs(v) < 10 else f"{v:.1f}",
                 ha="center",
                 va="bottom",
-                fontsize=8.5,
+                fontsize=value_fontsize,
                 rotation=0,
             )
-
     ax.set_title(title)
     ax.set_ylabel(ylabel)
-    ax.set_xticks(group_x)
+    ax.set_xticks(list(group_x))
     ax.set_xticklabels([DEFAULT_RUN_LABELS.get(b, b) for b in baselines], rotation=15, ha="right")
     ax.grid(axis="y", alpha=0.25)
-    ax.legend(loc="upper left", frameon=True)
+    if show_legend:
+        ax.legend(loc="upper left", frameon=True)
 
+
+def _grouped_bar_plot_by_baseline(
+    runs: Sequence[ExperimentRun],
+    value_by_key: Dict[str, float],
+    title: str,
+    ylabel: str,
+    output_dir: str,
+    filename: str,
+    load_multipliers: Sequence[int] = (1, 10),
+) -> str:
+    baselines = _grouped_bar_baselines(runs)
+    fig_width = max(10.5, 1.7 * len(baselines))
+    fig, ax = plt.subplots(figsize=(fig_width, 5.8))
+    _draw_grouped_bars_on_ax(
+        ax,
+        baselines,
+        value_by_key,
+        title,
+        ylabel,
+        load_multipliers=load_multipliers,
+        show_legend=True,
+    )
     return _save(fig, output_dir, filename)
+
+
+def plot_avg_metrics_row_grouped(
+    runs: Sequence[ExperimentRun],
+    output_dir: str,
+    prefix: str,
+    load_multipliers: Sequence[int] = (1, 10),
+) -> str:
+    """One row: same grouped charts as ``*_accuracy_avg_compare`` then ``*_latency_avg_compare`` (left to right)."""
+    chosen_metric = _accuracy_metric_name(runs[-1].metrics if runs else {})
+    baselines = _grouped_bar_baselines(runs)
+    panel_w = max(3.2, 1.15 * len(baselines))
+    fig, axes = plt.subplots(1, 2, figsize=(panel_w * 2, 5.9), sharey=False)
+    ax_acc, ax_lat = axes
+
+    val_avg_lat = {r.key: _average_latency_across_apps(r) for r in runs}
+    val_acc = {r.key: _average_accuracy_across_apps(r, chosen_metric) for r in runs}
+
+    _draw_grouped_bars_on_ax(
+        ax_acc,
+        baselines,
+        val_acc,
+        f"Average Accuracy Across Applications ({chosen_metric})",
+        chosen_metric,
+        load_multipliers=load_multipliers,
+        show_legend=True,
+        value_fontsize=8.0,
+    )
+    _draw_grouped_bars_on_ax(
+        ax_lat,
+        baselines,
+        val_avg_lat,
+        "Average Latency Across Applications",
+        "Average latency (ms)",
+        load_multipliers=load_multipliers,
+        show_legend=False,
+        value_fontsize=8.0,
+    )
+
+    fig.suptitle("Average accuracy and latency (app-averaged)", y=1.02, fontsize=12)
+    fig.tight_layout()
+    out_path = os.path.join(output_dir, f"{prefix}_avg_metrics_row.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def _simple_bars_on_ax(
+    ax: Axes,
+    runs: Sequence[ExperimentRun],
+    values: Sequence[float],
+    title: str,
+    ylabel: str,
+    *,
+    value_fontsize: float = 8.0,
+) -> None:
+    labels = [run.label for run in runs]
+    x = list(range(len(runs)))
+    bars = ax.bar(x, values, width=0.68)
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=20, ha="right")
+    ax.grid(axis="y", alpha=0.3)
+    for bar, value in zip(bars, values):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            bar.get_height(),
+            f"{value:.3f}" if abs(value) < 10 else f"{value:.1f}",
+            ha="center",
+            va="bottom",
+            fontsize=value_fontsize,
+        )
+
+
+def plot_avg_metrics_row_simple(runs: Sequence[ExperimentRun], output_dir: str, prefix: str) -> str:
+    """Non-``--root-dir`` runs: one row matching the two standalone bar charts."""
+    chosen_metric = _accuracy_metric_name(runs[-1].metrics if runs else {})
+    fig, axes = plt.subplots(1, 2, figsize=(max(14.0, 3.6 * len(runs)), 5.6), sharey=False)
+    ax_acc, ax_lat = axes
+
+    _simple_bars_on_ax(
+        ax_acc,
+        runs,
+        [_average_accuracy_across_apps(r, chosen_metric) for r in runs],
+        f"Average Accuracy Across Applications ({chosen_metric})",
+        chosen_metric,
+        value_fontsize=8.5,
+    )
+    _simple_bars_on_ax(
+        ax_lat,
+        runs,
+        [_average_latency_across_apps(r) for r in runs],
+        "Average Latency Across Applications",
+        "Average latency (ms)",
+        value_fontsize=8.5,
+    )
+
+    fig.suptitle("Average accuracy and latency (app-averaged)", y=1.02, fontsize=12)
+    fig.tight_layout()
+    out_path = os.path.join(output_dir, f"{prefix}_avg_metrics_row.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
 
 
 def plot_avg_latency_bar_multi(runs: Sequence[ExperimentRun], output_dir: str, prefix: str) -> str:
@@ -486,10 +621,17 @@ def plot_avg_accuracy_bar_multi(runs: Sequence[ExperimentRun], output_dir: str, 
 
 def write_comparison_plots(runs: Sequence[ExperimentRun], output_dir: str, prefix: str) -> List[str]:
     _ensure_output_dir(output_dir)
-    return [
+    paths: List[str] = [
         plot_avg_latency_bar_multi(runs, output_dir, prefix),
         plot_avg_accuracy_bar_multi(runs, output_dir, prefix),
     ]
+    if not runs:
+        return paths
+    if all(r.baseline_key and r.load_multiplier is not None for r in runs):
+        paths.append(plot_avg_metrics_row_grouped(runs, output_dir, prefix, load_multipliers=(1, 10)))
+    else:
+        paths.append(plot_avg_metrics_row_simple(runs, output_dir, prefix))
+    return paths
 
 
 def main() -> None:
