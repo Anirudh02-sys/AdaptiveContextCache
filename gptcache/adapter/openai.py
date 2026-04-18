@@ -46,6 +46,16 @@ elif _env_openai_base:
     openai.api_base = _env_openai_base
 
 
+def _dry_run_sleep_seconds() -> float:
+    """Synthetic per-request sleep in dry-run mode; tunable for load tests."""
+    raw = os.getenv("GPTCACHE_DRY_RUN_SLEEP_S", "1.0")
+    try:
+        sec = float(raw)
+    except (TypeError, ValueError):
+        sec = 1.0
+    return max(0.0, sec)
+
+
 class ChatCompletion(openai.ChatCompletion, BaseCacheLLM):
     """Openai ChatCompletion Wrapper
 
@@ -76,7 +86,7 @@ class ChatCompletion(openai.ChatCompletion, BaseCacheLLM):
         dry_run = bool(llm_kwargs.pop("dry_run", False))
         if dry_run:
             # Minimal OpenAI-style response without making a network call.
-            time.sleep(1.0)
+            time.sleep(_dry_run_sleep_seconds())
             return {
                 "choices": [
                     {
@@ -101,7 +111,7 @@ class ChatCompletion(openai.ChatCompletion, BaseCacheLLM):
     async def _allm_handler(cls, *llm_args, **llm_kwargs):
         dry_run = bool(llm_kwargs.pop("dry_run", False))
         if dry_run:
-            time.sleep(1.0)
+            time.sleep(_dry_run_sleep_seconds())
             return {
                 "choices": [
                     {

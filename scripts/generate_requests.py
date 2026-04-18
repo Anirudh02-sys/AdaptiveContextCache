@@ -10,13 +10,14 @@ requests to `/v1/chat/completions` while preserving history only within each
 conversation.
 
 `load_multiplier` scales **how many threads** run per application (config
-`threads_per_application` × `load_multiplier`, at least one thread per app). Per-thread
-pacing uses the configured delays unchanged; it does **not** divide sleep by LM.
+`threads_per_application` × `load_multiplier`, at least one thread per app).
 Compare against a nocache baseline only when the baseline was produced with the same
 effective thread layout (same LM), or accuracy keys may not line up.
 
-`load_multiplier_start_seconds` is kept in the config for compatibility but no longer
-changes pacing (thread count is fixed at process start from `load_multiplier`).
+When `load_multiplier_start_seconds` is positive and `load_multiplier > 1`, pacing is
+delayed-ramped: before the start second, each thread sleeps `load_multiplier` times
+longer (approx LM=1 equivalent aggregate load); at/after the start second, normal
+per-thread delay resumes (aggregate load rises toward LM).
 """
 
 from __future__ import annotations
@@ -425,6 +426,7 @@ def _thread_worker(
     state: RunState,
     log_path: str,
     log_lock: threading.Lock,
+    thread_activation_delay_s: float = 0.0,
 ) -> None:
     default_delay_ms = int(config.get("default_delay_ms", 150))
     app_delay_ms = int(config.get("app_delay_ms", {}).get(str(app_id), default_delay_ms))
@@ -439,6 +441,12 @@ def _thread_worker(
     max_turns = int(config.get("max_turns_per_conversation", 0))
     accuracy_enabled = bool(config.get("accuracy_enabled", True))
     timing_breakdown_enabled = bool(config.get("timing_breakdown_enabled", True))
+    load_mult = _safe_float(config.get("load_multiplier", 1.0), default=1.0)
+    if load_mult <= 0:
+        load_mult = 1.0
+    load_mult_start_s = _safe_float(config.get("load_multiplier_start_seconds", 0.0), default=0.0)
+    if load_mult_start_s < 0:
+        load_mult_start_s = 0.0
 
     api_key_env = str(config.get("api_key_env", "OPENAI_API_KEY"))
     api_key = os.getenv(api_key_env, "")
@@ -451,6 +459,34 @@ def _thread_worker(
 
     if not conversations:
         return
+
+    if thread_activation_delay_s > 0.0:
+        if experiment_end_time is not None:
+            remaining_exp_s = experiment_end_time - time.time()
+            if remaining_exp_s <= 0:
+                return
+            time.sleep(min(thread_activation_delay_s, remaining_exp_s))
+        else:
+            time.sleep(thread_activation_delay_s)
+
+    # For delayed LM runs, avoid a large t=0 burst from LM-scaled thread fanout.
+    # We apply an initial pre-request sleep for each thread during pre-activation.
+    if load_mult > 1.0 and load_mult_start_s > 0.0:
+        elapsed0 = time.time() - state.started_at
+        if elapsed0 < load_mult_start_s:
+            initial_raw_delay_s = (
+                app_delay_ms + thread_rng.randint(0, max(0, jitter_ms))
+            ) / 1000.0
+            initial_sleep_s = initial_raw_delay_s * load_mult
+            remaining_pre_activation_s = max(0.0, load_mult_start_s - elapsed0)
+            sleep_s = min(initial_sleep_s, remaining_pre_activation_s)
+            if experiment_end_time is not None:
+                remaining_exp_s = experiment_end_time - time.time()
+                if remaining_exp_s <= 0:
+                    return
+                sleep_s = min(sleep_s, remaining_exp_s)
+            if sleep_s > 0.0:
+                time.sleep(sleep_s)
 
     draw_count = max(0, int(conversation_draw_count))
     remaining_draws = draw_count
@@ -599,10 +635,16 @@ def _thread_worker(
                     with open(log_path, "a", encoding="utf-8") as f:
                         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-            # Inter-request pacing (load_multiplier does not shorten sleep; it scales
-            # thread count in `run()` instead).
+            # Inter-request pacing with optional delayed LM ramp:
+            # before load_multiplier_start_seconds, over-subscribed LM threads sleep
+            # `load_multiplier`x longer to approximate LM=1 aggregate pressure.
             raw_delay_s = (app_delay_ms + thread_rng.randint(0, max(0, jitter_ms))) / 1000.0
-            delay_s = raw_delay_s
+            delay_scale = 1.0
+            if load_mult > 1.0 and load_mult_start_s > 0.0:
+                elapsed_s = time.time() - state.started_at
+                if elapsed_s < load_mult_start_s:
+                    delay_scale = load_mult
+            delay_s = raw_delay_s * delay_scale
             if experiment_end_time is not None:
                 remaining_s = experiment_end_time - time.time()
                 if remaining_s <= 0:
@@ -998,7 +1040,10 @@ def run(config: Dict[str, Any]) -> Dict[str, Any]:
     )
     futures = []
     threads_per_app_effective: Dict[str, int] = {}
-    worker_jobs: List[Tuple[int, int, List[Dict[str, Any]], int]] = []
+    worker_jobs: List[Tuple[int, int, List[Dict[str, Any]], int, float]] = []
+    load_mult_start_s = _safe_float(config.get("load_multiplier_start_seconds", 0.0), default=0.0)
+    if load_mult_start_s < 0:
+        load_mult_start_s = 0.0
     for app_id in sorted(app_records.keys()):
         app_convs = app_records[app_id]
         if max_conversations > 0:
@@ -1012,14 +1057,20 @@ def run(config: Dict[str, Any]) -> Dict[str, Any]:
             conversation_draw_count = len(shard)
             if conversation_draw_count <= 0:
                 continue
-            worker_jobs.append((app_id, thread_idx, app_convs, conversation_draw_count))
+            # For delayed LM runs, extra threads beyond base_threads activate at start_s.
+            activation_delay_s = 0.0
+            if load_mult > 1.0 and load_mult_start_s > 0.0 and thread_idx >= base_threads:
+                activation_delay_s = load_mult_start_s
+            worker_jobs.append(
+                (app_id, thread_idx, app_convs, conversation_draw_count, activation_delay_s)
+            )
 
     max_workers_cfg = int(config.get("max_workers", 64))
     pool_size = max(max_workers_cfg, len(worker_jobs))
     total_threads = len(worker_jobs)
 
     with ThreadPoolExecutor(max_workers=pool_size) as executor:
-        for app_id, thread_idx, app_convs, conversation_draw_count in worker_jobs:
+        for app_id, thread_idx, app_convs, conversation_draw_count, activation_delay_s in worker_jobs:
             futures.append(
                 executor.submit(
                     _thread_worker,
@@ -1032,6 +1083,7 @@ def run(config: Dict[str, Any]) -> Dict[str, Any]:
                     state,
                     log_path,
                     log_lock,
+                    activation_delay_s,
                 )
             )
         for fut in as_completed(futures):
