@@ -218,6 +218,25 @@ def _ensure_output_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def _p99_latency_ms_slo_observed(stats: Dict[str, Any]) -> float:
+    """Same value used for latency SLO (`slo_observed.latency_p99_ms` in request metrics)."""
+    slo_obs = stats.get("slo_observed") or {}
+    raw = slo_obs.get("latency_p99_ms")
+    if raw is not None:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+    for key in ("served_p99_latency_ms", "p99_latency_ms"):
+        raw = stats.get(key)
+        if raw is not None:
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
 def _save(fig: Any, output_dir: str, filename: str) -> str:
     out_path = os.path.join(output_dir, filename)
     fig.tight_layout()
@@ -234,14 +253,14 @@ def plot_latency_compare_multi(runs: Sequence[ExperimentRun], output_dir: str, p
 
     def p99(m: Dict[str, Any]) -> List[float]:
         rows = _sorted_per_app(m)
-        return [float(stats.get("p99_latency_ms", 0.0)) for _, stats in rows]
+        return [_p99_latency_ms_slo_observed(stats) for _, stats in rows]
 
     fig, ax = plt.subplots(figsize=(12, 5))
     for run in runs:
         ax.plot(app_ids, p99(run.metrics), marker="o", label=f"{run.label} p99 (ms)")
-    ax.set_title("P99 Latency by Application")
+    ax.set_title("P99 Latency by Application (SLO-observed, same as latency SLO margin)")
     ax.set_xlabel("Application ID")
-    ax.set_ylabel("Latency p99 (ms)")
+    ax.set_ylabel("Latency p99 — slo_observed (ms)")
     ax.grid(alpha=0.3)
     ax.legend()
     return _save(fig, output_dir, f"{prefix}_latency_compare.png")
