@@ -25,12 +25,14 @@ class Config:
     :type skip_list: Optional[List[str]]
     :param context_len: optional, the length of context.
     :type context_len: Optional[int]
-    :param context_cache_window_len: base default window N (fixed); effective length is ``round(N * overall_factor) + app_delta`` clamped to ``[1, context_cache_window_max]``.
+    :param context_cache_window_len: base default window N (fixed); effective length is ``round(N * overall_factor) + app_delta`` clamped to ``[context_cache_window_min, context_cache_window_max]``.
     :type context_cache_window_len: int
     :param context_cache_overall_factor: load-adaptive multiplicative factor on the base default (starts at 1.0; adjusted by load controller).
     :type context_cache_overall_factor: float
     :param context_cache_window_delta_by_app: application_id -> per-app additive offset in turns (may be negative); missing ids use 0. Starts empty.
     :type context_cache_window_delta_by_app: Optional[Dict[str, int]]
+    :param context_cache_window_min: lower cap on the effective window length (default: 2).
+    :type context_cache_window_min: int
     :param context_cache_window_max: upper cap on the effective window length.
     :type context_cache_window_max: int
     :param load_adaptive: adaptivecontextcache: load-aware adaptation (minute counters + optional context window scaling).
@@ -87,6 +89,7 @@ class Config:
             context_cache_window_len: int = 5,
             context_cache_overall_factor: float = 1.0,
             context_cache_window_delta_by_app: Optional[Dict[str, int]] = None,
+            context_cache_window_min: int = 2,
             context_cache_window_max: int = 32,
             load_adaptive: bool = False,
             load_adaptive_ratio: float = 2.0,
@@ -110,13 +113,25 @@ class Config:
             raise CacheError(
                 "Invalid context_cache_window_len, expected integer >= 1"
             )
+        if context_cache_window_min < 1:
+            raise CacheError(
+                "Invalid context_cache_window_min, expected integer >= 1"
+            )
         if context_cache_window_max < 1:
             raise CacheError(
                 "Invalid context_cache_window_max, expected integer >= 1"
             )
+        if context_cache_window_min > context_cache_window_len:
+            raise CacheError(
+                "context_cache_window_min must be <= context_cache_window_len"
+            )
         if context_cache_window_max < context_cache_window_len:
             raise CacheError(
                 "context_cache_window_max must be >= context_cache_window_len"
+            )
+        if context_cache_window_min > context_cache_window_max:
+            raise CacheError(
+                "context_cache_window_min must be <= context_cache_window_max"
             )
         if context_cache_overall_factor <= 0:
             raise CacheError(
@@ -187,6 +202,7 @@ class Config:
         self.context_cache_window_len = context_cache_window_len
         self.context_cache_overall_factor = float(context_cache_overall_factor)
         self.context_cache_window_delta_by_app = _by_app_d
+        self.context_cache_window_min = context_cache_window_min
         self.context_cache_window_max = context_cache_window_max
         self.load_adaptive = load_adaptive
         self.load_adaptive_ratio = float(load_adaptive_ratio)
@@ -208,7 +224,7 @@ class Config:
         self.context_a = []
 
     def effective_context_window_len(self, application_id: Optional[str] = None) -> int:
-        """Effective window: ``round(N * overall_factor) + app_delta`` clamped to ``[1, max]``.
+        """Effective window: ``round(N * overall_factor) + app_delta`` clamped to ``[min, max]``.
 
         Global scaling (load adaptation) is multiplicative via ``overall_factor``; per-app
         tuning is an additive integer offset in turns (may be negative).
@@ -226,5 +242,6 @@ class Config:
                 except (TypeError, ValueError):
                     app_delta = 0
         w = int(round(n * overall)) + app_delta
+        w_min = int(self.context_cache_window_min)
         w_max = int(self.context_cache_window_max)
-        return max(1, min(w, w_max))
+        return max(w_min, min(w, w_max))

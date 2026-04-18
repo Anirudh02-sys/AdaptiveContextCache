@@ -473,7 +473,7 @@ def _thread_worker(
                     }
                 ],
                 "temperature": 0,
-                "max_tokens": 50,
+                "max_tokens": 200,
             }
             app_server_id_map = config.get("_app_id_to_server_id", {})
             if app_id in app_server_id_map:
@@ -644,7 +644,7 @@ def _run_warmup_conversation(
                 }
             ],
             "temperature": 0,
-            "max_tokens": 50,
+            "max_tokens": 200,
         }
 
         ok = False
