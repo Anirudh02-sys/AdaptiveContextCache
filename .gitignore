@@ -130,7 +130,15 @@ dmypy.json
 .pyre/
 
 .idea
-/data/
+/data/**
+!/data/**/
+!/data/**/plots/
+!/data/**/plots/compare/
+!/data/**/plots/compare/**/*.png
+!/data/**/plots/compare/**/*.jpg
+!/data/**/plots/compare/**/*.jpeg
+!/data/**/plots/compare/**/*.svg
+!/data/**/plots/compare/**/*.pdf
 **/data_map**.txt
 **/faiss**.index
 **/sqlite**.db
