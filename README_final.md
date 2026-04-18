@@ -37,7 +37,7 @@ Append any additional flags from the table below (for example `--load-adaptive`,
 
 **Load adaptation:** With **`--load-adaptive`**, each request (via the OpenAI adapter) feeds **token and request counts** into **`LoadAdaptiveContextController`**. Once per minute, the controller compares the sliding window to the **previous** minute; if traffic grew by at least **`--load-adaptive-ratio`** it **shrinks** the effective window (favoring cheaper, cache-friendly paths), and if traffic dropped by the inverse ratio it **grows** the window (up to **`context_cache_window_max`** in config). This keeps the dialogue window responsive to load without manual restarts.
 
-**SLO adaptation:** With **`--slo-adaptive`**, **`on_application_registry_changed()`** recomputes **per-application multipliers** `context_cache_window_factor_by_app` from the **latency** and **accuracy** targets stored for each server-issued application id. Stricter latency goals bias toward **shorter** effective windows (more aggressive caching); stricter accuracy goals bias toward **longer** windows (richer context). When the flag is off, every app factor stays at **1.0** regardless of registrations.
+**SLO adaptation:** With **`--slo-adaptive`**, **`on_application_registry_changed()`** recomputes **per-application additive offsets** `context_cache_window_delta_by_app` from the **latency** and **accuracy** targets stored for each server-issued application id. Stricter latency goals bias toward **negative** deltas (shorter effective windows, more aggressive caching); stricter accuracy goals bias toward **positive** deltas (longer windows, richer context). When the flag is off, every app delta stays at **0** regardless of registrations.
 
 Clients register targets with:
 
@@ -117,7 +117,7 @@ Parses CLI arguments, initializes **`cache`** (and optionally a second **`openai
 
 #### `on_application_registry_changed()`
 
-Runs whenever the in-memory registry of application SLOs changes. If **`slo_adaptive`** is off, it sets **per-app factors to 1.0** (neutral). If on, it reads **`_application_slos`** (latency and accuracy targets per server-issued application id), **normalizes** strictness scores, and computes a **bounded multiplicative factor per app** (latency-tight apps skew toward shorter context windows, accuracy-tight apps toward longer ones). It writes the result into **`cache.config.context_cache_window_factor_by_app`** (and `openai_cache` when present).
+Runs whenever the in-memory registry of application SLOs changes. If **`slo_adaptive`** is off, it sets **per-app deltas to 0** (neutral). If on, it reads **`_application_slos`** (latency and accuracy targets per server-issued application id), **normalizes** strictness scores, and computes a **bounded integer turn offset per app** (latency-tight apps get negative deltas for shorter context windows, accuracy-tight apps get positive deltas for longer ones). It writes the result into **`cache.config.context_cache_window_delta_by_app`** (and `openai_cache` when present).
 
 #### `register_application_slo` (`POST /v1/applications`)
 
@@ -135,7 +135,7 @@ Removes an entry from **`_application_slos`** and recomputes factors.
 
 ### [`gptcache/config.py`](gptcache/config.py) — `Config` and `effective_context_window_len`
 
-**`Config`** adds fields for **base** window length **`context_cache_window_len`**, **overall** multiplier **`context_cache_overall_factor`**, optional **per-application** map **`context_cache_window_factor_by_app`**, cap **`context_cache_window_max`**, and booleans **`load_adaptive`**, **`load_adaptive_ratio`**, **`slo_adaptive`**. **`effective_context_window_len(application_id)`** computes `round(N * overall * app_factor)` with `app_factor` defaulting to 1.0 when the id is missing, then **clamps** the result to `[1, context_cache_window_max]`. Dialogue-window truncation in the cache path uses this value rather than raw `N`.
+**`Config`** adds fields for **base** window length **`context_cache_window_len`**, **overall** multiplier **`context_cache_overall_factor`**, optional **per-application additive-offset** map **`context_cache_window_delta_by_app`**, cap **`context_cache_window_max`**, and booleans **`load_adaptive`**, **`load_adaptive_ratio`**, **`slo_adaptive`**. **`effective_context_window_len(application_id)`** computes `round(N * overall) + app_delta` with `app_delta` defaulting to 0 when the id is missing, then **clamps** the result to `[1, context_cache_window_max]`. Dialogue-window truncation in the cache path uses this value rather than raw `N`.
 
 ---
 
@@ -203,7 +203,7 @@ Runs a **paired micro-benchmark**: same workload twice against a live server—*
 
 #### [`scripts/run_app_window_factor_micro_eval.sh`](scripts/run_app_window_factor_micro_eval.sh)
 
-A heavier **async Python harness** (embedded heredoc) that compares **no-cache**, **contextcache without SLO adaptation**, and **contextcache with SLO adaptation**, using **asymmetric** synthetic workloads (**latency-sensitive** vs **accuracy-sensitive** templates). Optional **grid search** over base window, overall factor, and max window tests how **`context_cache_window_factor_by_app`** interacts with accuracy and latency; results can be written under a configurable **`RESULTS_DIR`**.
+A heavier **async Python harness** (embedded heredoc) that compares **no-cache**, **contextcache without SLO adaptation**, and **contextcache with SLO adaptation**, using **asymmetric** synthetic workloads (**latency-sensitive** vs **accuracy-sensitive** templates). Optional **grid search** over base window, overall factor, and max window tests how **`context_cache_window_delta_by_app`** interacts with accuracy and latency; results can be written under a configurable **`RESULTS_DIR`**.
 
 #### [`scripts/plot_experiment_results.sh`](scripts/plot_experiment_results.sh)
 

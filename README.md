@@ -515,13 +515,13 @@ Key config fields in `Config` (`gptcache/config.py`):
 - `auto_flush` - flush period for cache persistence.
 - `enable_token_counter`, `input_summary_len`, `data_check`, `disable_report`.
 
-### Context window sizing (base × overall × per-app)
+### Context window sizing (multiplicative global + additive per-app)
 
 ContextCache keeps a fixed **base** window size `context_cache_window_len` (call it \(N\)). The **effective**
 window size used when slicing dialogue-turn embeddings is computed per request:
 
 \[
-W = \mathrm{clamp}_{[1,\,W_{\max}]}\Big(\mathrm{round}\big(N \cdot f_{\text{overall}} \cdot f_{\text{app}}\big)\Big)
+W = \mathrm{clamp}_{[1,\,W_{\max}]}\Big(\mathrm{round}\big(N \cdot f_{\text{overall}}\big) + \delta_{\text{app}}\Big)
 \]
 
 Where:
@@ -530,27 +530,29 @@ Where:
 - **Overall factor** \(f_{\text{overall}}\): `context_cache_overall_factor` (starts at `1.0`).
   - When `load_adaptive` is enabled, the load controller periodically updates this **factor** (not `N`) so the
     effective window moves by \(\pm 1\) within `context_cache_window_max`.
-- **Per-app factor** \(f_{\text{app}}\): `context_cache_window_factor_by_app[application_id]` (defaults to `1.0` if missing).
-  - The map starts empty. When present, it lets different applications use different context window sizes
-    while sharing the same base \(N\) and overall factor.
+- **Per-app delta** \(\delta_{\text{app}}\): `context_cache_window_delta_by_app[application_id]` (defaults to `0` if missing).
+  - Integer turn offset (may be negative). The map starts empty. When present, it lets different applications
+    use different context window sizes while sharing the same base \(N\) and overall factor — expressed as an
+    absolute offset in turns rather than a relative scale.
 
-#### SLO-driven per-app factors (server hook)
+#### SLO-driven per-app deltas (server hook)
 
 When you register/deregister applications via `POST /v1/applications` / `DELETE /v1/applications/{id}`, the server
 calls `on_application_registry_changed()` (`gptcache_server/server.py`) which recomputes
-`context_cache_window_factor_by_app` from the registered **SLO targets**:
+`context_cache_window_delta_by_app` from the registered **SLO targets**:
 
-- **Latency strictness**: lower `latency_p99_ms` ⇒ stricter (uses `1/latency_p99_ms`)
-- **Accuracy strictness**: higher `accuracy_slo` ⇒ stricter
+- **Latency strictness**: lower `latency_p99_ms` ⇒ stricter (uses `1/latency_p99_ms`) ⇒ **negative** delta (shrink)
+- **Accuracy strictness**: higher `accuracy_slo` ⇒ stricter ⇒ **positive** delta (grow)
 
 Algorithm (low-latency, \(O(n)\) over registered apps):
 
 - Min-max normalize `1/latency_p99_ms` and `accuracy_slo` to \([0,1]\) (missing values contribute 0).
-- Strictness score per app:
-  - `strict = 0.7 * norm_latency + 0.3 * norm_accuracy`
-- Convert strictness to a multiplier via z-score and clipping:
-  - `f_app = clip(1 + 0.6 * zscore(strict), 0.5, 2.0)`
-- Renormalize multipliers so the **geometric mean is ~1.0** (keeps factors relative and avoids globally inflating/shrinking all windows).
+- Directional score per app (\(\alpha=0.8\), \(\beta=0.2\) biases toward latency reduction):
+  - `score = beta * norm_accuracy - alpha * norm_latency`
+- Map score to an integer turn offset, scaled by available headroom:
+  - positive score → up to `(W_max - N)` extra turns
+  - negative score → down to `-(N - 1)` turns (clamped so effective window stays ≥ 1)
+  - a small negative baseline shift keeps the average window below \(N\) for mixed app sets.
 
 Server CLI flags (`gptcache_server/server.py`):
 

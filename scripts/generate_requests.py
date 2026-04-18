@@ -281,6 +281,20 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _current_load_multiplier(
+    target_lm: float, start_s: float, experiment_start_time: float
+) -> float:
+    # Before `start_s` seconds elapse from the experiment start, requests are paced
+    # as if load_multiplier=1.0 so the system has a stable baseline phase. After the
+    # threshold, the configured target multiplier takes over. A non-positive
+    # `start_s` disables the delay and the target applies from t=0 (back-compat).
+    if start_s <= 0:
+        return target_lm
+    if (time.time() - experiment_start_time) >= start_s:
+        return target_lm
+    return 1.0
+
+
 class RunState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -387,6 +401,7 @@ def _thread_worker(
     conversations: Sequence[Dict[str, Any]],
     conversation_draw_count: int,
     experiment_end_time: Optional[float],
+    experiment_start_time: float,
     config: Dict[str, Any],
     state: RunState,
     log_path: str,
@@ -395,6 +410,11 @@ def _thread_worker(
     load_multiplier = _safe_float(config.get("load_multiplier", 1.0), default=1.0)
     if load_multiplier <= 0:
         load_multiplier = 1.0
+    lm_start_s = _safe_float(
+        config.get("load_multiplier_start_seconds", 0), default=0.0
+    )
+    if lm_start_s < 0:
+        lm_start_s = 0.0
     default_delay_ms = int(config.get("default_delay_ms", 150))
     app_delay_ms = int(config.get("app_delay_ms", {}).get(str(app_id), default_delay_ms))
     jitter_ms = int(config.get("thread_jitter_ms", 40))
@@ -557,8 +577,14 @@ def _thread_worker(
 
             # Global multiplier accelerates/decelerates pacing across all apps.
             # Example: load_multiplier=2.0 -> roughly half sleep duration -> ~2x load.
+            # When `load_multiplier_start_seconds` > 0, LM stays at 1.0 until that
+            # many seconds have elapsed since the experiment started, then switches
+            # to the configured target — evaluated per turn so the switch is live.
             raw_delay_s = (app_delay_ms + thread_rng.randint(0, max(0, jitter_ms))) / 1000.0
-            delay_s = raw_delay_s / load_multiplier
+            effective_lm = _current_load_multiplier(
+                load_multiplier, lm_start_s, experiment_start_time
+            )
+            delay_s = raw_delay_s / effective_lm
             if experiment_end_time is not None:
                 remaining_s = experiment_end_time - time.time()
                 if remaining_s <= 0:
@@ -951,6 +977,7 @@ def run(config: Dict[str, Any]) -> Dict[str, Any]:
                         app_convs,
                         conversation_draw_count,
                         experiment_end_time,
+                        state.started_at,
                         config,
                         state,
                         log_path,
@@ -1062,6 +1089,9 @@ def run(config: Dict[str, Any]) -> Dict[str, Any]:
             ),
         },
         "load_multiplier": _safe_float(config.get("load_multiplier", 1.0), default=1.0),
+        "load_multiplier_start_seconds": _safe_float(
+            config.get("load_multiplier_start_seconds", 0), default=0.0
+        ),
         "experiment_duration_seconds": round(experiment_duration_s, 3),
         "time_limited_run": bool(experiment_end_time is not None),
         "threads_spawned": total_threads,

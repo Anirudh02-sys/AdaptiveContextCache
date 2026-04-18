@@ -105,6 +105,57 @@ class LoadAdaptiveContextController:
             elif curr_tok <= prev_tok / ratio:
                 low_load = True
 
+        window_s = self._window.window_seconds
+        curr_rps = (curr_req / window_s) if window_s > 0 else 0.0
+        shrink_min_rps = float(getattr(cfg, "load_adaptive_shrink_min_rps", 0.0))
+        grow_max_rps = float(getattr(cfg, "load_adaptive_grow_max_rps", 0.0))
+        force_shrink_rps = float(getattr(cfg, "load_adaptive_force_shrink_rps", 0.0))
+        if high_load and shrink_min_rps > 0.0 and curr_rps < shrink_min_rps:
+            _logger.info(
+                "load_adaptive: ratio spike suppressed (curr_rps=%.3f < shrink_min=%.3f); "
+                "req %s→%s, tok %s→%s; effective window stays %s",
+                curr_rps,
+                shrink_min_rps,
+                prev_req,
+                curr_req,
+                prev_tok,
+                curr_tok,
+                w,
+            )
+            high_load = False
+        if low_load and grow_max_rps > 0.0 and curr_rps > grow_max_rps:
+            _logger.info(
+                "load_adaptive: ratio drop suppressed (curr_rps=%.3f > grow_max=%.3f); "
+                "req %s→%s, tok %s→%s; effective window stays %s",
+                curr_rps,
+                grow_max_rps,
+                prev_req,
+                curr_req,
+                prev_tok,
+                curr_tok,
+                w,
+            )
+            low_load = False
+
+        if (
+            force_shrink_rps > 0.0
+            and curr_rps >= force_shrink_rps
+            and not low_load
+        ):
+            if not high_load:
+                _logger.info(
+                    "load_adaptive: force-shrink (curr_rps=%.3f >= force=%.3f); "
+                    "req %s→%s, tok %s→%s; effective window %s",
+                    curr_rps,
+                    force_shrink_rps,
+                    prev_req,
+                    curr_req,
+                    prev_tok,
+                    curr_tok,
+                    w,
+                )
+            high_load = True
+
         if high_load and low_load:
             return
         if high_load:

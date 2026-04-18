@@ -406,7 +406,7 @@ async def _run_scenario(
             if pause_ms > 0:
                 await asyncio.sleep(pause_ms / 1000.0)
 
-    factors = dict(cache.config.context_cache_window_factor_by_app)
+    factors = dict(cache.config.context_cache_window_delta_by_app)
     summary = _summarize(rows, app_targets)
     gap = _gap_from_summary(summary, app_targets)
     return summary, factors, observed_map, gap

@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import os
 import uuid
 import zipfile
@@ -39,12 +40,12 @@ _application_slos_lock = Lock()
 
 
 def on_application_registry_changed() -> None:
-    """Recompute per-app context-window factors from registered SLO targets.
+    """Recompute per-app context-window deltas from registered SLO targets.
 
     Low-latency policy:
     - O(n) over registered applications
     - uses only *targets* (latency_p99_ms lower is stricter; accuracy_slo higher is stricter)
-    - assigns multiplicative factors around 1.0 and keeps the geometric mean near 1.0
+    - assigns additive integer offsets (turns) around 0; negative shrinks, positive grows
     """
 
     def _safe_float(x: Any) -> Optional[float]:
@@ -60,20 +61,20 @@ def on_application_registry_changed() -> None:
     with _application_slos_lock:
         items = list(_application_slos.items())
 
-    # If slo_adaptive is off, keep per-app multipliers neutral (1.0).
-    # This makes app-level scaling opt-in via --slo-adaptive / config.slo_adaptive.
+    # If slo_adaptive is off, keep per-app offsets neutral (0).
+    # This makes app-level tuning opt-in via --slo-adaptive / config.slo_adaptive.
     if not bool(getattr(cache.config, "slo_adaptive", False)):
-        ones = {app_id: 1.0 for app_id, _ in items}
-        cache.config.context_cache_window_factor_by_app = dict(ones)
+        zeros = {app_id: 0 for app_id, _ in items}
+        cache.config.context_cache_window_delta_by_app = dict(zeros)
         if openai_cache is not None:
-            openai_cache.config.context_cache_window_factor_by_app = dict(ones)
+            openai_cache.config.context_cache_window_delta_by_app = dict(zeros)
         return
 
-    # If no apps (or only one), keep factors empty / neutral.
+    # If no apps (or only one), keep deltas empty / neutral.
     if len(items) <= 1:
-        cache.config.context_cache_window_factor_by_app = {}
+        cache.config.context_cache_window_delta_by_app = {}
         if openai_cache is not None:
-            openai_cache.config.context_cache_window_factor_by_app = {}
+            openai_cache.config.context_cache_window_delta_by_app = {}
         return
 
     # Build per-app directional score from SLO targets.
@@ -108,24 +109,32 @@ def on_application_registry_changed() -> None:
     alpha = 0.8
     beta = 0.2
 
-    # center < 1.0 shifts all factors downward so the average window is
-    # smaller than the base — an overall latency improvement. gamma controls
-    # how aggressively the spread deviates from center.
-    center = 0.5
-    gamma = 1.5
-    min_f = 0.1
-    max_f = 2.0
-    factors = {}
+    # Map the normalized score to an integer turn offset. A strict-latency app
+    # (lat_n=1, acc_n=0) gets score=-alpha and is mapped to the full available
+    # shrink room (down to window=1). A strict-accuracy app (acc_n=1, lat_n=0)
+    # gets score=+beta and is mapped to the full available grow room (up to
+    # context_cache_window_max). The baseline_center bias (<0) keeps the average
+    # window below the base when apps are mixed — an overall latency improvement.
+    base_n = int(cache.config.context_cache_window_len)
+    w_max = int(cache.config.context_cache_window_max)
+    max_neg = max(0, base_n - 1)            # room to shrink (delta down to 1-base_n)
+    max_pos = max(0, w_max - base_n)        # room to grow (delta up to w_max-base_n)
+    baseline_center = -0.25                  # turns added to every registered app
+    deltas: Dict[str, int] = {}
     for app_id, _ in items:
         score = beta * acc_n.get(app_id, 0.0) - alpha * lat_n.get(app_id, 0.0)
-        f = center + gamma * score
-        f = max(min_f, min(max_f, f))
-        factors[app_id] = float(f)
+        if score >= 0:
+            raw = (score / beta) * max_pos if beta > 0 else 0.0
+        else:
+            raw = (score / alpha) * max_neg if alpha > 0 else 0.0
+        d = int(round(raw + baseline_center))
+        # clamp to headroom (defense in depth; effective_context_window_len also clamps)
+        d = max(-max_neg, min(max_pos, d))
+        deltas[app_id] = d
 
-    # Install factors (only for currently-registered apps).
-    cache.config.context_cache_window_factor_by_app = dict(factors)
+    cache.config.context_cache_window_delta_by_app = dict(deltas)
     if openai_cache is not None:
-        openai_cache.config.context_cache_window_factor_by_app = dict(factors)
+        openai_cache.config.context_cache_window_delta_by_app = dict(deltas)
 
 
 class CacheData(BaseModel):
@@ -363,6 +372,38 @@ def main():
         ),
     )
     parser.add_argument(
+        "--load-adaptive-shrink-min-rps",
+        type=float,
+        default=0.0,
+        metavar="RPS",
+        help=(
+            "absolute request-rate floor (req/s) gating shrink events: a ratio spike "
+            "only shrinks the window when current-window rate >= RPS. 0 disables the "
+            "gate (ratio check alone decides). Useful to suppress warmup->steady ramps."
+        ),
+    )
+    parser.add_argument(
+        "--load-adaptive-grow-max-rps",
+        type=float,
+        default=0.0,
+        metavar="RPS",
+        help=(
+            "absolute request-rate ceiling (req/s) gating grow events: a ratio drop "
+            "only grows the window when current-window rate <= RPS. 0 disables."
+        ),
+    )
+    parser.add_argument(
+        "--load-adaptive-force-shrink-rps",
+        type=float,
+        default=0.0,
+        metavar="RPS",
+        help=(
+            "absolute request-rate threshold (req/s) that forces a shrink each "
+            "evaluation regardless of ratio. Use when sustained load exceeds server "
+            "capacity and minute-over-minute ratios plateau. 0 disables."
+        ),
+    )
+    parser.add_argument(
         "--slo-adaptive",
         action="store_true",
         help="enable SLO-adaptive aspect (adaptivecontextcache; no-op until implemented).",
@@ -388,6 +429,20 @@ def main():
     args = parser.parse_args()
     if args.load_adaptive_ratio <= 1.0:
         parser.error("--load-adaptive-ratio must be > 1.0")
+    if args.load_adaptive_shrink_min_rps < 0:
+        parser.error("--load-adaptive-shrink-min-rps must be >= 0")
+    if args.load_adaptive_grow_max_rps < 0:
+        parser.error("--load-adaptive-grow-max-rps must be >= 0")
+    if args.load_adaptive_force_shrink_rps < 0:
+        parser.error("--load-adaptive-force-shrink-rps must be >= 0")
+
+    # Surface gptcache INFO logs (e.g., load_adaptive shrink/grow events) on the server's
+    # stderr alongside uvicorn's own logs so experiments can audit window transitions.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logging.getLogger("gptcache").setLevel(logging.INFO)
     global cache_dir
     global cache_file_key
     global server_mode
@@ -403,6 +458,9 @@ def main():
                 context_cache_window_len=args.context_cache_window_len,
                 load_adaptive=args.load_adaptive,
                 load_adaptive_ratio=args.load_adaptive_ratio,
+                load_adaptive_shrink_min_rps=args.load_adaptive_shrink_min_rps,
+                load_adaptive_grow_max_rps=args.load_adaptive_grow_max_rps,
+                load_adaptive_force_shrink_rps=args.load_adaptive_force_shrink_rps,
                 slo_adaptive=args.slo_adaptive,
             ),
         )
@@ -410,6 +468,9 @@ def main():
     cache.config.context_cache_window_len = args.context_cache_window_len
     cache.config.load_adaptive = args.load_adaptive
     cache.config.load_adaptive_ratio = args.load_adaptive_ratio
+    cache.config.load_adaptive_shrink_min_rps = args.load_adaptive_shrink_min_rps
+    cache.config.load_adaptive_grow_max_rps = args.load_adaptive_grow_max_rps
+    cache.config.load_adaptive_force_shrink_rps = args.load_adaptive_force_shrink_rps
     cache.config.slo_adaptive = args.slo_adaptive
     cache_file_key = args.cache_file_key
     server_mode = args.server_mode
@@ -434,12 +495,18 @@ def main():
                     context_cache_window_len=args.context_cache_window_len,
                     load_adaptive=args.load_adaptive,
                     load_adaptive_ratio=args.load_adaptive_ratio,
+                    load_adaptive_shrink_min_rps=args.load_adaptive_shrink_min_rps,
+                    load_adaptive_grow_max_rps=args.load_adaptive_grow_max_rps,
+                    load_adaptive_force_shrink_rps=args.load_adaptive_force_shrink_rps,
                     slo_adaptive=args.slo_adaptive,
                 ),
             )
         openai_cache.config.context_cache_window_len = args.context_cache_window_len
         openai_cache.config.load_adaptive = args.load_adaptive
         openai_cache.config.load_adaptive_ratio = args.load_adaptive_ratio
+        openai_cache.config.load_adaptive_shrink_min_rps = args.load_adaptive_shrink_min_rps
+        openai_cache.config.load_adaptive_grow_max_rps = args.load_adaptive_grow_max_rps
+        openai_cache.config.load_adaptive_force_shrink_rps = args.load_adaptive_force_shrink_rps
         openai_cache.config.slo_adaptive = args.slo_adaptive
 
         import_starlette()
