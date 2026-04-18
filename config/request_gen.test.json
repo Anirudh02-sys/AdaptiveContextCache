@@ -3,7 +3,7 @@
   "endpoint": "/v1/chat/completions",
   "model": "@azure-1/gpt-4o",
   "api_key_env": "VOCAREUM_API_KEY",
-  "data_dir": "data/test",
+  "data_dir": "test/",
   "file_glob": "application_*.jsonl",
   "warmup_file": "mt10_warmup_5.jsonl",
   "warmup_enabled": true,

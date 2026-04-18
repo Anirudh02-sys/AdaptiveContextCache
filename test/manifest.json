@@ -1,0 +1,70 @@
+{
+  "dataset": "mt10",
+  "split": "eval_50",
+  "num_applications": 5,
+  "num_conversations": 50,
+  "embedding_backend": "sentence_transformers",
+  "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+  "preprocessing": {
+    "min_turns": 4,
+    "max_conversations": 50,
+    "max_text_chars": 2400,
+    "max_user_chars": 1000
+  },
+  "output_files": [
+    {
+      "application_id": 0,
+      "topic_label": "hair, file, game, http, framework",
+      "num_conversations": 8,
+      "file_path": "data/mt10_50_apps/application_00.jsonl",
+      "topic_drift_distribution": {
+        "medium": 3,
+        "low": 4,
+        "high": 1
+      }
+    },
+    {
+      "application_id": 1,
+      "topic_label": "language, love, user, mother, assistant",
+      "num_conversations": 5,
+      "file_path": "data/mt10_50_apps/application_01.jsonl",
+      "topic_drift_distribution": {
+        "high": 3,
+        "medium": 2
+      }
+    },
+    {
+      "application_id": 2,
+      "topic_label": "human, cleaning, room, murderers, services",
+      "num_conversations": 10,
+      "file_path": "data/mt10_50_apps/application_02.jsonl",
+      "topic_drift_distribution": {
+        "high": 4,
+        "low": 3,
+        "medium": 3
+      }
+    },
+    {
+      "application_id": 3,
+      "topic_label": "service, user, brand, ai, pharmacy",
+      "num_conversations": 18,
+      "file_path": "data/mt10_50_apps/application_03.jsonl",
+      "topic_drift_distribution": {
+        "medium": 4,
+        "low": 8,
+        "high": 6
+      }
+    },
+    {
+      "application_id": 4,
+      "topic_label": "quantum, function, learning, dataset, algorithms",
+      "num_conversations": 9,
+      "file_path": "data/mt10_50_apps/application_04.jsonl",
+      "topic_drift_distribution": {
+        "medium": 4,
+        "high": 3,
+        "low": 2
+      }
+    }
+  ]
+}

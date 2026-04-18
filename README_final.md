@@ -74,18 +74,31 @@ Same overall pattern as `run_experiments.sh`, but **sweeps `load_multiplier`** (
 
 - **[`scripts/preprocess.py`](scripts/preprocess.py)** — Splits cleaned JSONL into warmup/eval portions, **embeds** conversations, **clusters** them into synthetic “applications,” and writes **`application_*.jsonl`** plus manifests under `data/` for use with `generate_requests.py`.
 
-### Small sample data under `data/`
+### Small sample data under `test/`
 
-All bundled inputs and example run artifacts for quick experiments live under the **[`data/`](data/)** directory.
+The smallest runnable **application JSONL** bundle for quick experiments lives under **[`test/`](test/)**. 
 
 | Path | Contents |
 |------|----------|
-| [`data/mt10_50_5_apps/`](data/mt10_50_5_apps/) | Five apps: `application_0.jsonl` … `application_4.jsonl`, warmup `mt10_warmup_50.jsonl`, `manifest.json`. Matches [`config/request_gen.example.json`](config/request_gen.example.json) (`data_dir`: `data/mt10_50_5_apps`). |
-| [`data/mt10_50_10_apps/`](data/mt10_50_10_apps/) | Ten-app variant (larger). |
-| [`data/test_apps/example/`](data/test_apps/example/) | Example `request_metrics_*.json`, `request_log_*.jsonl`, and `plots/` from prior runs (usable with plot/compare scripts without re-running the server). |
-| [`data/prewarm/`](data/prewarm/) | Example warmup logs (e.g. `warmup_log.jsonl`) when prewarm is enabled in the request config. |
+| [`test/`](test/) | Five apps: `application_00.jsonl` … `application_04.jsonl`, warmup `mt10_warmup_5.jsonl`, `manifest.json`. Matches [`config/request_gen.test.json`](config/request_gen.test.json) (`data_dir`: `test/`, `warmup_file`: `mt10_warmup_5.jsonl`, `file_glob`: `application_*.jsonl`). |
 
-[`config/request_gen.live_test.json`](config/request_gen.live_test.json) is a short run (e.g. 30s duration, few turns). Set `data_dir` to a directory **under `data/`** that contains `application_*.jsonl` (for example `data/mt10_50_5_apps`), not an empty `data/` root.
+
+[`config/request_gen.test.json`](config/request_gen.test.json) matches the `test/` layout above (five apps; experiment length and limits are set in that JSON).
+
+Below is an **example** to run our code: run the server in one shell, then the request generator in another.
+
+- **Server command:**
+
+```bash
+python3 -m gptcache_server.server --server-mode contextcache --slo-adaptive --load-adaptive
+```
+
+- **Requests command:**
+
+```bash
+python3 scripts/generate_requests.py --config config/request_gen.test.json
+```
+
 
 ### API keys and backends
 
