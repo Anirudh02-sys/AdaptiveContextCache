@@ -8,6 +8,13 @@ from gptcache.utils.error import NotInitError
 from gptcache.utils.log import gptcache_log
 from gptcache.utils.time import time_cal
 
+def _now_ms() -> float:
+    return time.perf_counter() * 1000.0
+
+
+def _ms_since(start_ms: float) -> float:
+    return max(0.0, _now_ms() - start_ms)
+
 
 def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     a = np.asarray(a, dtype=np.float32)
@@ -76,6 +83,9 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
     :return: llm result
     """
     start_time = time.time()
+    want_timings = bool(kwargs.pop("return_timings", False))
+    timings: dict = {}
+    t0_ms = _now_ms()
     user_temperature = "temperature" in kwargs
     user_top_k = "top_k" in kwargs
     temperature = kwargs.pop("temperature", 0.0)
@@ -121,6 +131,7 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
     )
 
     # get current query and optional context from kwargs
+    t_pre_ms = _now_ms()
     pre_process_res = time_cal(
         chat_cache.pre_embedding_func,
         func_name="pre_process",
@@ -131,6 +142,7 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
         prompts=chat_cache.config.prompts,
         cache_config=chat_cache.config,
     )
+    timings["pre_ms"] = _ms_since(t_pre_ms)
     if isinstance(pre_process_res, tuple) and len(pre_process_res) == 2:
         pre_embedding_res, context_res = pre_process_res
     else:
@@ -153,12 +165,15 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
             print(pre_embedding_data)
 
     if cache_enable:
+        t_emb_q_ms = _now_ms()
         embedding_data = time_cal(
             chat_cache.embedding_func,
             func_name="embedding",
             report_func=chat_cache.report.embedding,
         )(pre_embedding_data, extra_param=context.get("embedding_func", None))
+        timings["embed_query_ms"] = _ms_since(t_emb_q_ms)
     if cache_enable and not cache_skip:
+        t_search_ms = _now_ms()
         search_data_list = time_cal(
             chat_cache.data_manager.search,
             func_name="search",
@@ -170,6 +185,7 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
             # if (user_temperature and not user_top_k)
             # else kwargs.pop("top_k", 5),
         )
+        timings["search_ms"] = _ms_since(t_search_ms)
 
         if search_data_list is None:
             search_data_list = []
@@ -187,6 +203,7 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
             _cw = chat_cache.config.effective_context_window_len(_application_id)
             max_history = max(0, _cw - 1)
             context_res = context_res[-max_history:] if max_history > 0 else []
+            t_emb_ctx_ms = _now_ms()
             cur_context_data = [
                 time_cal(
                     chat_cache.embedding_func,
@@ -199,6 +216,7 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
             chat_cache.config.context_emb = cur_context_data
             cur_context_data = np.array(cur_context_data)
             pre_id = cur_id - 1
+            timings["embed_context_ms"] = _ms_since(t_emb_ctx_ms)
         elif len(chat_cache.config.context_a) > 0:
             # Fallback for any legacy code paths that use config.context_a.
             pre_id = cur_id - 1
@@ -228,8 +246,12 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
         threshold = chat_cache.config.similarity_threshold
         dialuoge_threshold = chat_cache.config.dialuoge_threshold
         # exact_match
+        t_get_ms_total = 0.0
+        t_eval_ms = 0.0
+        t_post_ms = 0.0
         if chat_cache.config.set_use_api == False:
             for search_data in search_data_list:
+                t_get_ms = _now_ms()
                 cache_data = time_cal(
                     chat_cache.data_manager.get_scalar_data,
                     func_name="get_data",
@@ -239,6 +261,7 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                     extra_param=context.get("get_scalar_data", None),
                     session=session,
                 )
+                t_get_ms_total += _ms_since(t_get_ms)
                 if cache_data is None:
                     continue
 
@@ -295,6 +318,8 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                     retrival_id_query[cache_data.cur_id] = False
                 chat_cache.data_manager.hit_cache_callback(search_data)
 
+        if t_get_ms_total:
+            timings["get_scalar_ms"] = t_get_ms_total
           
         if len(cache_answers) != 0:
             cache_answers = sorted(cache_answers, key=lambda x: x[0], reverse=True)
@@ -316,11 +341,13 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                     )
                 return return_message
             
+            t_post_ms = _now_ms()
             return_message = time_cal(
                 post_process,
                 func_name="post_process",
                 report_func=chat_cache.report.post,
             )()
+            timings["post_ms"] = _ms_since(t_post_ms)
             
             chat_cache.report.hint_cache()
             cache_whole_data = answers_dict.get(str(return_message))
@@ -343,6 +370,15 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                     else "",
                     cache_whole_data[0],
                     round(time.time() - start_time, 6),
+                )
+            timings["total_ms"] = _ms_since(t0_ms)
+            if want_timings:
+                return (
+                    cache_data_convert(return_message),
+                    True,
+                    retrival_id_query,
+                    retrival_id_context,
+                    timings,
                 )
             return cache_data_convert(return_message), True, retrival_id_query, retrival_id_context
 
@@ -378,9 +414,11 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                 context_description += f"The above content is the previous contextual conversation record. Please answer the current question: {current_question}"
                 kwargs['messages'][-1]["content"] = context_description
 
+        t_llm_ms = _now_ms()
         llm_data = time_cal(
             llm_handler, func_name="llm_request", report_func=chat_cache.report.llm
         )(*args, **kwargs)
+        timings["llm_ms"] = _ms_since(t_llm_ms)
         # Support both OpenAI-style responses and plain adapter payloads
         # (e.g., API put/get helpers that pass through strings/None).
         if isinstance(llm_data, dict) and "choices" in llm_data:
@@ -401,6 +439,7 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                         if embedding_data is not None
                         else np.array([])
                     )
+                t_save_ms = _now_ms()
                 time_cal(
                     chat_cache.data_manager.save,
                     func_name="save",
@@ -415,6 +454,7 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
                     extra_param=context.get("save_func", None),
                     session=session,
                 )
+                timings["save_ms"] = timings.get("save_ms", 0.0) + _ms_since(t_save_ms)
                 if (
                     chat_cache.report.op_save.count > 0
                     and chat_cache.report.op_save.count % chat_cache.config.auto_flush
@@ -428,6 +468,9 @@ def adapt(llm_handler, cache_data_convert, update_cache_callback, *args, **kwarg
             gptcache_log.error("failed to save the data to cache", exc_info=True)
 
     chat_cache.config.cur_id = chat_cache.config.cur_id + 1
+    timings["total_ms"] = _ms_since(t0_ms)
+    if want_timings:
+        return llm_data, False, retrival_id_query, retrival_id_context, timings
     return llm_data, False, retrival_id_query, retrival_id_context
 
 

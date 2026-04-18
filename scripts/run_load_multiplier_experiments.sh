@@ -14,7 +14,7 @@
 # Layout:
 #   data/test_apps/load_mult_compare/lm1|lm10/request_metrics_<suffix>.json
 #   data/test_apps/load_mult_compare/plots/lm1|lm10/<suffix>/   (per-run plots)
-#   data/test_apps/load_mult_compare/plots/compare_avg_all/     (app-averaged bars across selected runs)
+#   data/test_apps/load_mult_compare/plots/compare_avg_all/     (grouped LM=1 vs LM=10 bars per suffix)
 #
 # Usage:
 #   ./scripts/run_load_multiplier_experiments.sh
@@ -87,7 +87,7 @@ OPENAI_API_BASE_VALUE="${OPENAI_API_BASE:-https://api.openai.com/v1}"
 VOCAREUM_API_KEY_VALUE="${VOCAREUM_API_KEY:-}"
 VOCAREUM_API_BASE_VALUE="${VOCAREUM_BASE_URL:-https://genai.vocareum.com/v1}"
 
-export VOCAREUM_API_KEY=
+export VOCAREUM_API_KEY=voc-1418745524204245488322369b6ea35cacbb5.02522614
 export VOCAREUM_BASE_URL=https://genai.vocareum.com/v1
 
 
@@ -249,16 +249,6 @@ should_run() {
   [[ " ${RUN_ONLY_SUFFIXES} " == *" ${want} "* ]]
 }
 
-append_compare_run_if_present() {
-  local -n args_ref="$1"
-  local key="$2"
-  local label="$3"
-  local metrics_path="$4"
-  if [[ -f "${metrics_path}" ]]; then
-    args_ref+=(--run "${key}:${metrics_path}" --label "${key}:${label}")
-  fi
-}
-
 for LOAD_MULT in 1 10; do
   if should_run "nocache"; then
     run_experiment "${LOAD_MULT}" "no-cache" "nocache"
@@ -278,23 +268,49 @@ done
 compare_avg_all_dir="${PLOTS_ROOT}/compare_avg_all"
 mkdir -p "${compare_avg_all_dir}"
 
-compare_args=()
-append_compare_run_if_present compare_args "nocache_lm1" "no-cache (LM=1)" "${D_ABS}/lm1/request_metrics_nocache.json"
-append_compare_run_if_present compare_args "nocache_lm10" "no-cache (LM=10)" "${D_ABS}/lm10/request_metrics_nocache.json"
-append_compare_run_if_present compare_args "gptcache_lm1" "gptcache (LM=1)" "${D_ABS}/lm1/request_metrics_gptcache.json"
-append_compare_run_if_present compare_args "gptcache_lm10" "gptcache (LM=10)" "${D_ABS}/lm10/request_metrics_gptcache.json"
-append_compare_run_if_present compare_args "contextcache_lm1" "contextcache (LM=1)" "${D_ABS}/lm1/request_metrics_contextcache.json"
-append_compare_run_if_present compare_args "adaptive_load_lm1" "adaptive context (LM=1)" "${D_ABS}/lm1/request_metrics_adaptive_load.json"
-append_compare_run_if_present compare_args "contextcache_lm10" "contextcache (LM=10)" "${D_ABS}/lm10/request_metrics_contextcache.json"
-append_compare_run_if_present compare_args "adaptive_load_lm10" "adaptive context (LM=10)" "${D_ABS}/lm10/request_metrics_adaptive_load.json"
+COMPARE_AVG_ALL_PREFIX="${COMPARE_AVG_ALL_PREFIX:-compare_avg_all}"
 
-if ((${#compare_args[@]} > 0)); then
+# Grouped comparison plot (LM=1 vs LM=10 side-by-side per baseline) via
+# scripts/compare_experiments_avg.py --root-dir/--suffix.
+compare_suffix_args=()
+if should_run "nocache"; then
+  compare_suffix_args+=(--suffix nocache)
+fi
+if should_run "gptcache"; then
+  compare_suffix_args+=(--suffix gptcache)
+fi
+if should_run "contextcache"; then
+  compare_suffix_args+=(--suffix contextcache)
+fi
+if should_run "adaptive_load"; then
+  compare_suffix_args+=(--suffix adaptive_load)
+fi
+
+if ((${#compare_suffix_args[@]} > 0)); then
   "${PYTHON_BIN}" scripts/compare_experiments_avg.py \
-    "${compare_args[@]}" \
+    --root-dir "${D_ABS}" \
+    "${compare_suffix_args[@]}" \
     --output-dir "${compare_avg_all_dir}" \
-    --prefix "compare_avg_all"
+    --prefix "${COMPARE_AVG_ALL_PREFIX}"
 else
-  echo "Skipping averaged comparison plot: no metrics files found."
+  echo "Skipping averaged comparison plot: RUN_ONLY_SUFFIXES did not include any known suffixes."
+fi
+
+# Optional: latency breakdown ablation plot for adaptive contextcache (load-adaptive suffix).
+# Requires request logs to include `timing_breakdown` (from updated client/server).
+if should_run "adaptive_load"; then
+  lm1_log="${D_ABS}/lm1/request_log_adaptive_load.jsonl"
+  lm10_log="${D_ABS}/lm10/request_log_adaptive_load.jsonl"
+  if [[ -f "${lm1_log}" && -f "${lm10_log}" ]]; then
+    echo "Writing adaptive_load latency breakdown ablation plot..."
+    "${PYTHON_BIN}" scripts/plot_latency_breakdown_ablation.py \
+      --root-dir "${D_ABS}" \
+      --suffix adaptive_load \
+      --output-dir "${compare_avg_all_dir}" \
+      --prefix "compare_avg_all_latency_breakdown_ablation"
+  else
+    echo "Skipping latency breakdown ablation plot: missing ${lm1_log} or ${lm10_log}"
+  fi
 fi
 
 echo "All load-multiplier experiments complete."

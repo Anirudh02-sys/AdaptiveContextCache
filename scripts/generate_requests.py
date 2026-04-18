@@ -185,6 +185,20 @@ def _extract_response_details(resp_json: Any) -> Tuple[str, Optional[bool]]:
     return _extract_response_text(resp_json), None
 
 
+def _extract_timing_breakdown(resp_json: Any) -> Optional[Dict[str, Any]]:
+    # Expected branch shape on this repo can be:
+    # [answer_payload, is_hit, query_flags, context_flags, timings]
+    if isinstance(resp_json, list) and resp_json:
+        if len(resp_json) >= 5 and isinstance(resp_json[4], dict):
+            return resp_json[4]
+        return None
+    if isinstance(resp_json, dict):
+        tb = resp_json.get("timings") or resp_json.get("timing_breakdown")
+        if isinstance(tb, dict):
+            return tb
+    return None
+
+
 def _normalize_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
 
@@ -383,7 +397,7 @@ def _request_once(
     payload: Dict[str, Any],
     timeout_s: float,
     dry_run: bool,
-) -> Tuple[bool, str, float, int, Optional[bool]]:
+) -> Tuple[bool, str, float, int, Optional[bool], Optional[Dict[str, Any]]]:
     start = time.time()
     if dry_run:
         time.sleep(0.01)
@@ -394,9 +408,11 @@ def _request_once(
     resp = session.post(url, headers=headers, json=payload, timeout=timeout_s)
     latency_ms = (time.time() - start) * 1000.0
     if resp.status_code >= 400:
-        return False, resp.text[:500], latency_ms, resp.status_code, None
-    response_text, is_hit = _extract_response_details(resp.json())
-    return True, response_text, latency_ms, resp.status_code, is_hit
+        return False, resp.text[:500], latency_ms, resp.status_code, None, None
+    resp_json = resp.json()
+    response_text, is_hit = _extract_response_details(resp_json)
+    timing_breakdown = _extract_timing_breakdown(resp_json)
+    return True, response_text, latency_ms, resp.status_code, is_hit, timing_breakdown
 
 
 def _thread_worker(
@@ -422,6 +438,7 @@ def _thread_worker(
     model = str(config.get("model", "gpt-3.5-turbo"))
     max_turns = int(config.get("max_turns_per_conversation", 0))
     accuracy_enabled = bool(config.get("accuracy_enabled", True))
+    timing_breakdown_enabled = bool(config.get("timing_breakdown_enabled", True))
 
     api_key_env = str(config.get("api_key_env", "OPENAI_API_KEY"))
     api_key = os.getenv(api_key_env, "")
@@ -473,8 +490,10 @@ def _thread_worker(
                     }
                 ],
                 "temperature": 0,
-                "max_tokens": 50,
+                "max_tokens": 200,
             }
+            if timing_breakdown_enabled:
+                payload["return_timings"] = True
             app_server_id_map = config.get("_app_id_to_server_id", {})
             if app_id in app_server_id_map:
                 payload["application_id"] = app_server_id_map[app_id]
@@ -486,11 +505,19 @@ def _thread_worker(
             last_err = ""
             is_cache_hit: Optional[bool] = None
             is_placeholder_response = False
+            timing_breakdown: Optional[Dict[str, Any]] = None
 
             for attempt in range(retry_count + 1):
                 attempt_start = time.time()
                 try:
-                    ok, response_text, latency_ms, status_code, is_cache_hit = _request_once(
+                    (
+                        ok,
+                        response_text,
+                        latency_ms,
+                        status_code,
+                        is_cache_hit,
+                        timing_breakdown,
+                    ) = _request_once(
                         session=session,
                         base_url=base_url,
                         endpoint=endpoint,
@@ -560,6 +587,8 @@ def _thread_worker(
                     "response_text": used_answer,
                     "request_content_count": len(content_list),
                 }
+                if timing_breakdown:
+                    entry["timing_breakdown"] = timing_breakdown
                 if accuracy:
                     entry["accuracy"] = {
                         "exact_match": round(float(accuracy["exact_match"]), 6),
@@ -608,6 +637,7 @@ def _run_warmup_conversation(
     base_url = str(config.get("base_url", "http://127.0.0.1:8012"))
     model = str(config.get("model", "gpt-3.5-turbo"))
     max_turns = int(config.get("max_turns_per_conversation", 0))
+    timing_breakdown_enabled = bool(config.get("timing_breakdown_enabled", True))
 
     pairs = _pairs_from_record(conversation)
     if max_turns > 0:
@@ -644,8 +674,10 @@ def _run_warmup_conversation(
                 }
             ],
             "temperature": 0,
-            "max_tokens": 50,
+            "max_tokens": 200,
         }
+        if timing_breakdown_enabled:
+            payload["return_timings"] = True
 
         ok = False
         response_text = ""
@@ -653,11 +685,19 @@ def _run_warmup_conversation(
         status_code = 0
         last_err = ""
         is_cache_hit: Optional[bool] = None
+        timing_breakdown: Optional[Dict[str, Any]] = None
 
         for attempt in range(retry_count + 1):
             attempt_start = time.time()
             try:
-                ok, response_text, latency_ms, status_code, is_cache_hit = _request_once(
+                (
+                    ok,
+                    response_text,
+                    latency_ms,
+                    status_code,
+                    is_cache_hit,
+                    timing_breakdown,
+                ) = _request_once(
                     session=session,
                     base_url=base_url,
                     endpoint=endpoint,
@@ -710,6 +750,8 @@ def _run_warmup_conversation(
                 "response_snippet": used_answer[:240],
                 "request_content_count": len(content_list),
             }
+            if timing_breakdown:
+                entry["timing_breakdown"] = timing_breakdown
             with log_lock:
                 with open(warmup_log_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")

@@ -38,11 +38,31 @@ class ExperimentRun:
     metrics_path: str
     log_path: str
     metrics: Dict[str, Any]
+    baseline_key: str = ""
+    load_multiplier: Optional[int] = None
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare latency and accuracy across experiments using app-averaged bars."
+    )
+    parser.add_argument(
+        "--root-dir",
+        default=None,
+        help=(
+            "Root directory containing lm1/ and lm10/ subfolders with request_metrics_*.json "
+            "(e.g. data/test_apps/load_mult_compare). When set, use --suffix to select baselines."
+        ),
+    )
+    parser.add_argument(
+        "--suffix",
+        action="append",
+        default=None,
+        metavar="SUFFIX",
+        help=(
+            "Baseline suffix to compare when using --root-dir "
+            "(repeatable; examples: nocache, gptcache, contextcache, adaptive_load)."
+        ),
     )
     parser.add_argument(
         "--run",
@@ -148,8 +168,50 @@ def load_experiment_runs(
     return runs
 
 
+def _load_mult_runs_from_root(
+    root_dir: str,
+    suffixes: Sequence[str],
+    label_overrides: Optional[Dict[str, str]] = None,
+    load_multipliers: Sequence[int] = (1, 10),
+) -> List[ExperimentRun]:
+    root = os.path.abspath(root_dir)
+    label_over = label_overrides or {}
+    runs: List[ExperimentRun] = []
+    for suffix in suffixes:
+        suffix = str(suffix).strip()
+        if not suffix:
+            continue
+        for lm in load_multipliers:
+            metrics_path = os.path.join(root, f"lm{lm}", f"request_metrics_{suffix}.json")
+            if not os.path.isfile(metrics_path):
+                raise SystemExit(f"error: metrics file not found: {metrics_path}")
+            log_path = infer_request_log_path(metrics_path)
+            key = f"{suffix}_lm{lm}"
+            label = label_over.get(suffix) or DEFAULT_RUN_LABELS.get(suffix) or suffix
+            with open(metrics_path, "r", encoding="utf-8") as f:
+                metrics = json.load(f)
+            runs.append(
+                ExperimentRun(
+                    key=key,
+                    label=label,
+                    metrics_path=metrics_path,
+                    log_path=log_path,
+                    metrics=metrics,
+                    baseline_key=suffix,
+                    load_multiplier=int(lm),
+                )
+            )
+    return runs
+
+
 def build_runs_from_args(args: argparse.Namespace) -> List[ExperimentRun]:
     label_over = parse_label_flags(args.label)
+
+    if args.root_dir:
+        suffixes = args.suffix or []
+        if not suffixes:
+            raise SystemExit("error: --root-dir requires at least one --suffix")
+        return _load_mult_runs_from_root(args.root_dir, suffixes, label_overrides=label_over)
 
     if args.run:
         specs = [parse_run_arg(x) for x in args.run]
@@ -297,7 +359,96 @@ def _bar_plot(
     return _save(fig, output_dir, filename)
 
 
+def _grouped_bar_plot_by_baseline(
+    runs: Sequence[ExperimentRun],
+    value_by_key: Dict[str, float],
+    title: str,
+    ylabel: str,
+    output_dir: str,
+    filename: str,
+    load_multipliers: Sequence[int] = (1, 10),
+) -> str:
+    # Preserve baseline order as provided (runs were constructed in suffix order).
+    baselines: List[str] = []
+    seen = set()
+    for r in runs:
+        b = r.baseline_key or r.key
+        if b not in seen:
+            baselines.append(b)
+            seen.add(b)
+
+    lm_list = [int(x) for x in load_multipliers]
+    series_count = len(lm_list)
+    group_x = list(range(len(baselines)))
+    group_width = 0.76
+    bar_w = group_width / max(1, series_count)
+
+    # One distinct color per baseline; LM variants use hatch/alpha.
+    cmap = plt.get_cmap("tab10")
+    baseline_color: Dict[str, Any] = {
+        b: cmap(i % 10) for i, b in enumerate(baselines)
+    }
+
+    fig_width = max(10.5, 1.7 * len(baselines))
+    fig, ax = plt.subplots(figsize=(fig_width, 5.8))
+
+    lm_styles = {
+        lm_list[0]: {"alpha": 0.75, "hatch": ""},
+        lm_list[1] if len(lm_list) > 1 else lm_list[0]: {"alpha": 1.0, "hatch": "//"},
+    }
+
+    for j, lm in enumerate(lm_list):
+        offsets = [gx - (group_width / 2.0) + (j + 0.5) * bar_w for gx in group_x]
+        vals = []
+        for b in baselines:
+            k = f"{b}_lm{lm}"
+            vals.append(float(value_by_key.get(k, 0.0)))
+        style = lm_styles.get(lm, {"alpha": 1.0, "hatch": ""})
+        bars = ax.bar(
+            offsets,
+            vals,
+            width=bar_w * 0.92,
+            color=[baseline_color[b] for b in baselines],
+            edgecolor="black",
+            linewidth=0.3,
+            alpha=style["alpha"],
+            hatch=style["hatch"],
+            label=f"LM={lm}",
+        )
+        for bar, v in zip(bars, vals):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                bar.get_height(),
+                f"{v:.3f}" if abs(v) < 10 else f"{v:.1f}",
+                ha="center",
+                va="bottom",
+                fontsize=8.5,
+                rotation=0,
+            )
+
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.set_xticks(group_x)
+    ax.set_xticklabels([DEFAULT_RUN_LABELS.get(b, b) for b in baselines], rotation=15, ha="right")
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend(loc="upper left", frameon=True)
+
+    return _save(fig, output_dir, filename)
+
+
 def plot_avg_latency_bar_multi(runs: Sequence[ExperimentRun], output_dir: str, prefix: str) -> str:
+    # If runs came from --root-dir, we have baseline_key and load_multiplier populated.
+    if runs and all(r.baseline_key and r.load_multiplier is not None for r in runs):
+        value_by_key = {r.key: _average_latency_across_apps(r) for r in runs}
+        return _grouped_bar_plot_by_baseline(
+            runs,
+            value_by_key,
+            "Average Latency Across Applications",
+            "Average latency (ms)",
+            output_dir,
+            f"{prefix}_latency_avg_compare.png",
+            load_multipliers=(1, 10),
+        )
     values = [_average_latency_across_apps(run) for run in runs]
     return _bar_plot(
         runs,
@@ -311,6 +462,17 @@ def plot_avg_latency_bar_multi(runs: Sequence[ExperimentRun], output_dir: str, p
 
 def plot_avg_accuracy_bar_multi(runs: Sequence[ExperimentRun], output_dir: str, prefix: str) -> str:
     chosen_metric = _accuracy_metric_name(runs[-1].metrics if runs else {})
+    if runs and all(r.baseline_key and r.load_multiplier is not None for r in runs):
+        value_by_key = {r.key: _average_accuracy_across_apps(r, chosen_metric) for r in runs}
+        return _grouped_bar_plot_by_baseline(
+            runs,
+            value_by_key,
+            f"Average Accuracy Across Applications ({chosen_metric})",
+            chosen_metric,
+            output_dir,
+            f"{prefix}_accuracy_avg_compare.png",
+            load_multipliers=(1, 10),
+        )
     values = [_average_accuracy_across_apps(run, chosen_metric) for run in runs]
     return _bar_plot(
         runs,

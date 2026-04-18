@@ -170,6 +170,7 @@ class ChatCompletion(openai.ChatCompletion, BaseCacheLLM):
         chat_cache = kwargs.get("cache_obj", cache)
         enable_token_counter = chat_cache.config.enable_token_counter
         cache_mode = kwargs.pop("cache_mode", "contextcache")
+        want_timings = bool(kwargs.get("return_timings", False))
 
         if chat_cache.config.load_adaptive:
             msgs = kwargs.get("messages") or []
@@ -196,26 +197,26 @@ class ChatCompletion(openai.ChatCompletion, BaseCacheLLM):
         if cache_mode == "gptcache":
             cache_context = kwargs.setdefault("cache_context", {})
             cache_context["ignore_context"] = True
-            ans, is_hit, retrival_id_query, retrival_id_context = adapt(
+            out = adapt(
                 cls._llm_handler,
                 cache_data_convert,
                 cls._update_cache_callback,
                 *args,
                 **kwargs,
             )
-            return ans, is_hit, retrival_id_query, retrival_id_context
+            return out
         if cache_mode == "no-cache":
             kwargs["cache_skip"] = True
         if cache_mode not in ("contextcache", "adaptivecontextcache", "no-cache"):
             raise ValueError(f"unsupported cache_mode: {cache_mode}")
-        ans, is_hit, retrival_id_query, retrival_id_context = adapt(
+        out = adapt(
             cls._llm_handler,
             cache_data_convert,
             cls._update_cache_callback,
             *args,
             **kwargs,
         )
-        return ans, is_hit, retrival_id_query, retrival_id_context
+        return out
 
     @classmethod
     async def acreate(cls, *args, **kwargs):
