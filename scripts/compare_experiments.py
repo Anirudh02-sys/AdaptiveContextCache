@@ -245,11 +245,64 @@ def _save(fig: Any, output_dir: str, filename: str) -> str:
     return out_path
 
 
+def _get_app_ids(runs: Sequence[ExperimentRun]) -> List[int]:
+    rows0 = _sorted_per_app(runs[0].metrics)
+    return [app_id for app_id, _ in rows0]
+
+
+def _accuracy_metric_name(metrics: Dict[str, Any]) -> str:
+    metric = str(metrics.get("slo_summary", {}).get("accuracy_metric", "avg_token_f1"))
+    if metric not in {"exact_match_rate", "avg_token_f1", "avg_sequence_ratio"}:
+        return "avg_token_f1"
+    return metric
+
+
+def _accuracy_series(metrics: Dict[str, Any], metric: str) -> List[float]:
+    rows = _sorted_per_app(metrics)
+    return [float(stats.get(metric, 0.0)) for _, stats in rows]
+
+
+def _latency_slo_margins(metrics: Dict[str, Any]) -> List[float]:
+    rows = _sorted_per_app(metrics)
+    margins: List[float] = []
+    for _, stats in rows:
+        target = (stats.get("slo_target", {}) or {}).get("latency_p99_ms")
+        observed = (stats.get("slo_observed", {}) or {}).get("latency_p99_ms")
+        margin = 0.0
+        if target is not None and observed is not None:
+            try:
+                t = float(target)
+                o = float(observed)
+                margin = t - o
+            except (TypeError, ValueError):
+                margin = 0.0
+        margins.append(margin)
+    return margins
+
+
+def _accuracy_slo_margins(metrics: Dict[str, Any]) -> List[float]:
+    rows = _sorted_per_app(metrics)
+    margins: List[float] = []
+    accuracy_metric = str(metrics.get("slo_summary", {}).get("accuracy_metric", "avg_sequence_ratio"))
+    for _, stats in rows:
+        target = (stats.get("slo_target", {}) or {}).get("accuracy_slo")
+        observed = (stats.get("slo_observed", {}) or {}).get(accuracy_metric)
+        margin = 0.0
+        if target is not None and observed is not None:
+            try:
+                t = float(target)
+                o = float(observed)
+                margin = o - t
+            except (TypeError, ValueError):
+                margin = 0.0
+        margins.append(margin)
+    return margins
+
+
 def plot_latency_compare_multi(runs: Sequence[ExperimentRun], output_dir: str, prefix: str) -> str:
     if not runs:
         raise ValueError("runs must be non-empty")
-    rows0 = _sorted_per_app(runs[0].metrics)
-    app_ids = [app_id for app_id, _ in rows0]
+    app_ids = _get_app_ids(runs)
 
     def p99(m: Dict[str, Any]) -> List[float]:
         rows = _sorted_per_app(m)
@@ -299,8 +352,7 @@ def _load_avg_latency_ms_from_log(log_path: str) -> Dict[int, float]:
 def plot_avg_latency_compare_multi(runs: Sequence[ExperimentRun], output_dir: str, prefix: str) -> str:
     if not runs:
         raise ValueError("runs must be non-empty")
-    rows0 = _sorted_per_app(runs[0].metrics)
-    app_ids = [app_id for app_id, _ in rows0]
+    app_ids = _get_app_ids(runs)
 
     fig, ax = plt.subplots(figsize=(12, 5))
     for run in runs:
@@ -318,26 +370,14 @@ def plot_avg_latency_compare_multi(runs: Sequence[ExperimentRun], output_dir: st
 def plot_accuracy_compare_multi(runs: Sequence[ExperimentRun], output_dir: str, prefix: str) -> str:
     if not runs:
         raise ValueError("runs must be non-empty")
-    rows0 = _sorted_per_app(runs[0].metrics)
-    app_ids = [app_id for app_id, _ in rows0]
-
-    def accuracy_metric_name(m: Dict[str, Any]) -> str:
-        metric = str(m.get("slo_summary", {}).get("accuracy_metric", "avg_token_f1"))
-        if metric not in {"exact_match_rate", "avg_token_f1", "avg_sequence_ratio"}:
-            return "avg_token_f1"
-        return metric
-
-    chosen_metric = accuracy_metric_name(runs[-1].metrics)
-
-    def acc(m: Dict[str, Any], metric: str) -> List[float]:
-        rows = _sorted_per_app(m)
-        return [float(stats.get(metric, 0.0)) for _, stats in rows]
+    app_ids = _get_app_ids(runs)
+    chosen_metric = _accuracy_metric_name(runs[-1].metrics)
 
     fig, ax = plt.subplots(figsize=(12, 5))
     for run in runs:
         ax.plot(
             app_ids,
-            acc(run.metrics, chosen_metric),
+            _accuracy_series(run.metrics, chosen_metric),
             marker="o",
             label=f"{run.label} {chosen_metric}",
         )
@@ -352,52 +392,16 @@ def plot_accuracy_compare_multi(runs: Sequence[ExperimentRun], output_dir: str, 
 def plot_slo_compare_multi(runs: Sequence[ExperimentRun], output_dir: str, prefix: str) -> Tuple[str, str]:
     if not runs:
         raise ValueError("runs must be non-empty")
-    rows0 = _sorted_per_app(runs[0].metrics)
-    app_ids = [app_id for app_id, _ in rows0]
+    app_ids = _get_app_ids(runs)
     n = len(runs)
     bar_width = min(0.8 / max(n, 1), 0.28)
     offsets = [(i - (n - 1) / 2.0) * bar_width for i in range(n)]
     x = list(range(len(app_ids)))
 
-    def latency_margins(m: Dict[str, Any]) -> List[float]:
-        rows = _sorted_per_app(m)
-        margins: List[float] = []
-        for _, stats in rows:
-            target = (stats.get("slo_target", {}) or {}).get("latency_p99_ms")
-            observed = (stats.get("slo_observed", {}) or {}).get("latency_p99_ms")
-            margin = 0.0
-            if target is not None and observed is not None:
-                try:
-                    t = float(target)
-                    o = float(observed)
-                    margin = t - o
-                except (TypeError, ValueError):
-                    margin = 0.0
-            margins.append(margin)
-        return margins
-
-    def accuracy_margins(m: Dict[str, Any]) -> List[float]:
-        rows = _sorted_per_app(m)
-        margins: List[float] = []
-        accuracy_metric = str(m.get("slo_summary", {}).get("accuracy_metric", "avg_sequence_ratio"))
-        for _, stats in rows:
-            target = (stats.get("slo_target", {}) or {}).get("accuracy_slo")
-            observed = (stats.get("slo_observed", {}) or {}).get(accuracy_metric)
-            margin = 0.0
-            if target is not None and observed is not None:
-                try:
-                    t = float(target)
-                    o = float(observed)
-                    margin = o - t
-                except (TypeError, ValueError):
-                    margin = 0.0
-            margins.append(margin)
-        return margins
-
     fig_lat, ax_lat = plt.subplots(figsize=(12, 5))
     ax_lat.axhline(0.0, color="#666666", linewidth=1, linestyle="--")
     for off, run in zip(offsets, runs):
-        lat = latency_margins(run.metrics)
+        lat = _latency_slo_margins(run.metrics)
         ax_lat.bar([xi + off for xi in x], lat, width=bar_width, label=run.label)
     ax_lat.set_xticks(x)
     ax_lat.set_xticklabels(app_ids)
@@ -411,7 +415,7 @@ def plot_slo_compare_multi(runs: Sequence[ExperimentRun], output_dir: str, prefi
     fig_acc, ax_acc = plt.subplots(figsize=(12, 5))
     ax_acc.axhline(0.0, color="#666666", linewidth=1, linestyle="--")
     for off, run in zip(offsets, runs):
-        accm = accuracy_margins(run.metrics)
+        accm = _accuracy_slo_margins(run.metrics)
         ax_acc.bar([xi + off for xi in x], accm, width=bar_width, label=run.label)
     ax_acc.set_xticks(x)
     ax_acc.set_xticklabels(app_ids)
@@ -425,6 +429,72 @@ def plot_slo_compare_multi(runs: Sequence[ExperimentRun], output_dir: str, prefi
     return lat_path, acc_path
 
 
+def plot_compare_grid_multi(runs: Sequence[ExperimentRun], output_dir: str, prefix: str) -> str:
+    """2x2 grid: accuracy, accuracy SLO margin, latency p99, latency SLO margin."""
+    if not runs:
+        raise ValueError("runs must be non-empty")
+    app_ids = _get_app_ids(runs)
+    chosen_metric = _accuracy_metric_name(runs[-1].metrics)
+    n = len(runs)
+    bar_width = min(0.8 / max(n, 1), 0.28)
+    offsets = [(i - (n - 1) / 2.0) * bar_width for i in range(n)]
+    x = list(range(len(app_ids)))
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    ax_acc = axes[0][0]
+    ax_acc_slo = axes[0][1]
+    ax_p99 = axes[1][0]
+    ax_lat_slo = axes[1][1]
+
+    for run in runs:
+        ax_acc.plot(
+            app_ids,
+            _accuracy_series(run.metrics, chosen_metric),
+            marker="o",
+            label=run.label,
+        )
+    ax_acc.set_title(f"Accuracy ({chosen_metric})")
+    ax_acc.set_xlabel("Application ID")
+    ax_acc.set_ylabel(chosen_metric)
+    ax_acc.grid(alpha=0.3)
+    ax_acc.legend()
+
+    ax_acc_slo.axhline(0.0, color="#666666", linewidth=1, linestyle="--")
+    for off, run in zip(offsets, runs):
+        accm = _accuracy_slo_margins(run.metrics)
+        ax_acc_slo.bar([xi + off for xi in x], accm, width=bar_width, label=run.label)
+    ax_acc_slo.set_title("Accuracy SLO Margin")
+    ax_acc_slo.set_xticks(x)
+    ax_acc_slo.set_xticklabels(app_ids)
+    ax_acc_slo.set_xlabel("Application ID")
+    ax_acc_slo.set_ylabel("Observed - target")
+    ax_acc_slo.grid(axis="y", alpha=0.3)
+    ax_acc_slo.legend()
+
+    for run in runs:
+        series = [_p99_latency_ms_slo_observed(stats) for _, stats in _sorted_per_app(run.metrics)]
+        ax_p99.plot(app_ids, series, marker="o", label=run.label)
+    ax_p99.set_title("Latency p99 (SLO-observed)")
+    ax_p99.set_xlabel("Application ID")
+    ax_p99.set_ylabel("Latency p99 (ms)")
+    ax_p99.grid(alpha=0.3)
+    ax_p99.legend()
+
+    ax_lat_slo.axhline(0.0, color="#666666", linewidth=1, linestyle="--")
+    for off, run in zip(offsets, runs):
+        lat = _latency_slo_margins(run.metrics)
+        ax_lat_slo.bar([xi + off for xi in x], lat, width=bar_width, label=run.label)
+    ax_lat_slo.set_title("Latency SLO Margin")
+    ax_lat_slo.set_xticks(x)
+    ax_lat_slo.set_xticklabels(app_ids)
+    ax_lat_slo.set_xlabel("Application ID")
+    ax_lat_slo.set_ylabel("Target - observed (ms)")
+    ax_lat_slo.grid(axis="y", alpha=0.3)
+    ax_lat_slo.legend()
+
+    return _save(fig, output_dir, f"{prefix}_compare_grid.png")
+
+
 def write_comparison_plots(runs: Sequence[ExperimentRun], output_dir: str, prefix: str) -> List[str]:
     """Generate all comparison figures; returns list of written paths."""
     _ensure_output_dir(output_dir)
@@ -434,6 +504,7 @@ def write_comparison_plots(runs: Sequence[ExperimentRun], output_dir: str, prefi
     paths.append(plot_accuracy_compare_multi(runs, output_dir, prefix))
     lat_slo, acc_slo = plot_slo_compare_multi(runs, output_dir, prefix)
     paths.extend([lat_slo, acc_slo])
+    paths.append(plot_compare_grid_multi(runs, output_dir, prefix))
     return paths
 
 

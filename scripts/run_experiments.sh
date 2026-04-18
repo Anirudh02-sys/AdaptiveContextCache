@@ -46,19 +46,24 @@ fi
 # Uses .venv/bin/python when present, else python3 on PATH. Override with PYTHON=...
 #
 # DRY_RUN controls the server's upstream dry-run flag (--dry-run yes).
+# Optional: EXPERIMENT_DURATION_SECONDS=120 overrides request_gen experiment_duration_seconds
+# for quicker iteration (default: use value from config/request_gen.example.json).
+# Optional: SERVER_READY_TIMEOUT_S=90 — seconds to wait for the server HTTP probe (default: 90).
 
 DRY_RUN="${DRY_RUN:-no}"          # yes|no -> passed to server
 CACHE_DIR="${CACHE_DIR:-/tmp/contextcache_data}"
 EXAMPLE_CONFIG="config/request_gen.example.json"
 METRICS_BASE_DIR="data/test_apps/example"
 PLOTS_BASE_DIR="${METRICS_BASE_DIR}/plots"
+# Latency SLO anchors (served p99 ms, prior contextcache run): app0=1932 app1=1824 app2=1978 app3=2009 app4=1900.
+# application_slo_expectations in config/request_gen.example.json uses strict targets for apps 2-3 and loose for 0,1,4.
 
 # API keys must come from the environment — never commit real credentials.
 # Example before running:
 #   export OPENAI_API_KEY=...
 #   export OPENAI_API_BASE=https://api.openai.com/v1
-export VOCAREUM_API_KEY=voc-1418745524204245488322369b6ea35cacbb5.02522614
-export VOCAREUM_BASE_URL=https://genai.vocareum.com/v1
+#   export VOCAREUM_API_KEY=...
+#   export VOCAREUM_BASE_URL=https://genai.vocareum.com/v1
 
 OPENAI_API_KEY_VALUE="${OPENAI_API_KEY:-}"
 OPENAI_API_BASE_VALUE="${OPENAI_API_BASE:-https://api.openai.com/v1}"
@@ -67,14 +72,14 @@ VOCAREUM_API_BASE_VALUE="${VOCAREUM_BASE_URL:-https://genai.vocareum.com/v1}"
 
 # export OPENAI_API_KEY="${OPENAI_API_KEY_VALUE}"
 # export OPENAI_API_BASE="${OPENAI_API_BASE_VALUE}"
-export VOCAREUM_API_KEY="${VOCAREUM_API_KEY_VALUE}"
+export VOCAREUM_API_KEY=
 export VOCAREUM_BASE_URL="${VOCAREUM_API_BASE_VALUE}"
 
 mkdir -p "${METRICS_BASE_DIR}"
 mkdir -p "${PLOTS_BASE_DIR}"
 
 server_cmd_base=(
-  env -u APPIMAGE "${PYTHON_BIN}" -m gptcache_server.server
+  env -u APPIMAGE PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m gptcache_server.server
   -s 127.0.0.1
   -p 8012
   -d "${CACHE_DIR}"
@@ -86,7 +91,7 @@ if [[ "${DRY_RUN}" == "yes" ]]; then
 fi
 
 wait_for_server() {
-  local timeout_s=30
+  local timeout_s="${SERVER_READY_TIMEOUT_S:-90}"
   local start
   start=$(date +%s)
   while true; do
@@ -123,9 +128,11 @@ run_experiment() {
 
   local metrics_path="${METRICS_BASE_DIR}/request_metrics_${suffix}.json"
   local log_path="${METRICS_BASE_DIR}/request_log_${suffix}.jsonl"
+  local nocache_baseline_log="${METRICS_BASE_DIR}/request_log_nocache.jsonl"
   local model="gpt-3.5-turbo" # or "@azure-1/gpt-4o"
 
-  local baseline_abs="${PWD}/${METRICS_BASE_DIR}/request_log_nocache.jsonl"
+  # Nocache run records the reference log; other modes compare accuracy to that log
+  # (same thread layout as this script’s nocache run).
   if [[ "${suffix}" == "nocache" ]]; then
     jq \
       --arg metrics_path "${metrics_path}" \
@@ -139,12 +146,17 @@ run_experiment() {
     jq \
       --arg metrics_path "${metrics_path}" \
       --arg log_path "${log_path}" \
-      --arg baseline "${baseline_abs}" \
+      --arg baseline_log "${nocache_baseline_log}" \
       '.output_metrics_path = $metrics_path
         | .output_request_log_path = $log_path
         | .accuracy_baseline_reference_run = false
-        | .accuracy_baseline_log_path = $baseline' \
+        | .accuracy_baseline_log_path = $baseline_log' \
       "${EXAMPLE_CONFIG}" > "${tmp_config}"
+  fi
+
+  if [[ -n "${EXPERIMENT_DURATION_SECONDS:-}" ]]; then
+    jq --argjson dur "${EXPERIMENT_DURATION_SECONDS}" '.experiment_duration_seconds = $dur' "${tmp_config}" > "${tmp_config}.dur"
+    mv "${tmp_config}.dur" "${tmp_config}"
   fi
 
   local server_cmd=("${server_cmd_base[@]}" "--server-mode" "${mode}" "${extra_server_args[@]}")
@@ -180,16 +192,21 @@ run_experiment() {
 
 # Baseline experiments (uncomment when you want to regenerate nocache / gptcache / contextcache metrics):
 # Temporarily skipped to save time; uncomment to regenerate nocache / gptcache metrics.
-# run_experiment "no-cache" "nocache"
-# run_experiment "gptcache" "gptcache"
+run_experiment "no-cache" "nocache"
+run_experiment "gptcache" "gptcache"
 run_experiment "contextcache" "contextcache"
 
-# SLO-adaptive context cache: adaptivecontextcache + --slo-adaptive (see gptcache_server --help).
-run_experiment "adaptivecontextcache" "adaptive_slo" --slo-adaptive
+# SLO-adaptive: --slo-adaptive-* flags tune window deltas (see gptcache_server --help).
+run_experiment "adaptivecontextcache" "adaptive_slo" \
+  --slo-adaptive \
+  --slo-adaptive-alpha "${SLO_ADAPTIVE_ALPHA:-0.8}" \
+  --slo-adaptive-beta "${SLO_ADAPTIVE_BETA:-0.2}" \
+  --slo-adaptive-baseline-center "${SLO_ADAPTIVE_BASELINE_CENTER:--0.25}"
 
 compare_output_dir="${PLOTS_BASE_DIR}/compare"
 mkdir -p "${compare_output_dir}"
 
+# Optional nocache/gptcache: add more --run lines here (do not put # inside a \-continued command).
 "${PYTHON_BIN}" scripts/compare_experiments.py \
   --run "nocache:${METRICS_BASE_DIR}/request_metrics_nocache.json" \
   --run "gptcache:${METRICS_BASE_DIR}/request_metrics_gptcache.json" \
