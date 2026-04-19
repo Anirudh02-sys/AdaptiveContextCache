@@ -156,6 +156,20 @@ def parse_args() -> argparse.Namespace:
         default=1000,
         help="Metadata only, for manifest tracking.",
     )
+    parser.add_argument(
+        "--max-turn-pairs",
+        type=int,
+        default=10,
+        help="Maximum number of turn pairs allowed.",
+    )
+    parser.add_argument(
+        "--dataset-size",
+        type=int,
+        default=50,
+        help="Number of conversations to sample.",
+    )
+
+
     return parser.parse_args()
 
 
@@ -178,6 +192,17 @@ def write_jsonl(path: str, rows: Sequence[Dict[str, Any]]) -> None:
     with open(path, "w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def filter_rows_by_turn_pairs(rows, max_turn_pairs):
+    kept = []
+    for row in rows:
+        pairs = _build_pairs(row.get("turns", []))
+        if len(pairs) <= max_turn_pairs:
+            new_row = dict(row)
+            new_row["turn_pairs"] = pairs
+            kept.append(new_row)
+    return kept
 
 
 def split_warmup_pool(
@@ -390,31 +415,59 @@ def main() -> None:
     rows = load_jsonl(args.input_file)
     print(f"Loaded rows: {len(rows)}")
 
-    warmup_rows, warmup_n = split_warmup_pool(
-        rows,
-        warmup_ratio=args.warmup_ratio,
-        rng=rng
-    )
-    warmup_rows_with_pairs = []
-    for row in warmup_rows:
-        new_row = dict(row)
-        new_row["turn_pairs"] = _build_pairs(row.get("turns", []))
-        warmup_rows_with_pairs.append(new_row)
+    # warmup_rows, warmup_n = split_warmup_pool(
+    #     rows,
+    #     warmup_ratio=args.warmup_ratio,
+    #     rng=rng
+    # )
+    # warmup_rows_with_pairs = []
+    # for row in warmup_rows:
+    #     new_row = dict(row)
+    #     new_row["turn_pairs"] = _build_pairs(row.get("turns", []))
+    #     warmup_rows_with_pairs.append(new_row)
 
-    if len(warmup_rows_with_pairs) < args.eval_count:
+    # if len(warmup_rows_with_pairs) < args.eval_count:
+    #     raise ValueError(
+    #         f"Warmup pool smaller than eval_count. "
+    #         f"warmup={len(warmup_rows_with_pairs)}, eval_count={args.eval_count}"
+    #     )
+
+    # eval_rows = rng.sample(warmup_rows_with_pairs, args.eval_count)
+
+    print("Filtering by max turn pairs...")
+    filtered_rows = filter_rows_by_turn_pairs(rows, args.max_turn_pairs)
+
+    print(f"Eligible rows: {len(filtered_rows)}")
+
+    if len(filtered_rows) < args.dataset_size:
         raise ValueError(
-            f"Warmup pool smaller than eval_count. "
-            f"warmup={len(warmup_rows_with_pairs)}, eval_count={args.eval_count}"
+            f"Need {args.dataset_size} rows but only found {len(filtered_rows)}"
         )
 
-    eval_rows = rng.sample(warmup_rows_with_pairs, args.eval_count)
+    selected_rows = rng.sample(filtered_rows, args.dataset_size)
 
-    warmup_path = os.path.join(args.output_dir, f"{label}_warmup_{len(warmup_rows)}.jsonl")
-    eval_path = os.path.join(args.output_dir, f"{label}_eval_{len(eval_rows)}.jsonl")
-    apps_output_dir = os.path.join(args.output_dir, f"{label}_eval_{len(eval_rows)}_apps")
+    # same 50 rows used for both warmup + workload
+    warmup_rows = selected_rows
+    eval_rows = selected_rows
+
+    # warmup_path = os.path.join(args.output_dir, f"{label}_warmup_{len(warmup_rows)}.jsonl")
+    # eval_path = os.path.join(args.output_dir, f"{label}_eval_{len(eval_rows)}.jsonl")
+    warmup_path = os.path.join(
+        args.output_dir,
+        f"{label}_warmup_{len(warmup_rows)}.jsonl"
+    )
+    eval_path = os.path.join(
+        args.output_dir,
+        f"{label}_{len(eval_rows)}.jsonl"
+    )
+
+    apps_output_dir = os.path.join(
+        args.output_dir,
+        f"{label}_{len(eval_rows)}_apps"
+    )
     split_manifest_path = os.path.join(args.output_dir, f"{label}_split_manifest.json")
 
-    write_jsonl(warmup_path, warmup_rows_with_pairs)
+    write_jsonl(warmup_path, warmup_rows)
     write_jsonl(eval_path, eval_rows)
 
     print(f"Wrote warmup file: {warmup_path}")
@@ -462,12 +515,12 @@ def main() -> None:
         "label": label,
         "input_file": args.input_file,
         "total_rows": len(rows),
-        "warmup_ratio": args.warmup_ratio,
+        "warmup_ratio": 1.0,
         "warmup_count": len(warmup_rows),
         "eval_count": len(eval_rows),
         "sampling": {
             "warmup_random_sample": True,
-            "eval_random_sample_from_warmup": True,
+            "same_dataset_for_warmup_and_apps": True,
             "overlap": True,
             "seed": args.seed,
         },
