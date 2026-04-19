@@ -3,10 +3,9 @@ import os
 import pickle
 from dataclasses import dataclass
 from typing import Any, Dict, List, Sequence, Tuple
-
 import numpy as np
-from sentence_transformers import SentenceTransformer
-import json
+
+from drift_utils import Embedder, load_jsonl, make_history_unit
 
 """
 This is build the candidate pool (simulates the cache)for the drift experiment.
@@ -37,51 +36,6 @@ class CandidateEntry:
     full_prior_context: List[Dict[str, Any]]
     query_embedding: np.ndarray
     context_sequence: np.ndarray
-
-
-class Embedder:
-    def __init__(
-        self,
-        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-        batch_size: int = 128,
-    ):
-        self.model_name = model_name
-        self.batch_size = batch_size
-        self.model = SentenceTransformer(model_name)
-
-    def encode(self, texts: Sequence[str]) -> np.ndarray:
-        texts = [str(t) for t in texts]
-        if not texts:
-            return np.zeros((0, 384), dtype=np.float32)
-
-        embeddings = self.model.encode(
-            list(texts),
-            batch_size=self.batch_size,
-            show_progress_bar=True,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-        )
-        return embeddings.astype(np.float32)
-    
-
-def load_jsonl(path: str) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line_num, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            obj = json.loads(line)
-            if not isinstance(obj, dict):
-                raise ValueError(f"Line {line_num} in {path} is not a JSON object")
-            rows.append(obj)
-    return rows
-
-
-def make_history_unit(turn_pair: Dict[str, Any]) -> str:
-    user_text = str(turn_pair.get("user", "") or "")
-    assistant_text = str(turn_pair.get("assistant", "") or "")
-    return f"Previous user question: {user_text}\nPrevious model response: {assistant_text}"
 
 
 def build_candidate_pool(
