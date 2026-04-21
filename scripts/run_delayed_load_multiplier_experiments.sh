@@ -22,11 +22,11 @@
 #
 # Usage:
 #   ./scripts/run_delayed_load_multiplier_experiments.sh
-#   DRY_RUN=yes ./scripts/run_delayed_load_multiplier_experiments.sh
+#   DRY_RUN=no ./scripts/run_delayed_load_multiplier_experiments.sh   # real upstream LLM on cache miss
 #
 # Environment:
 #   PYTHON              Python interpreter (default: .venv/bin/python or python3)
-#   DRY_RUN             yes|no — server upstream dry-run (default: no)
+#   DRY_RUN             yes|no — server --dry-run (stub LLM on miss); default: yes
 #   CACHE_DIR           Server cache directory cleared each run (default: /tmp/contextcache_data_load_mult_delayed)
 #   LOAD_ADAPTIVE_RATIO Passed to --load-adaptive-ratio (default: 2.0, must be > 1)
 #   EXAMPLE_CONFIG      Request-gen template (default: config/request_gen.example.json)
@@ -66,7 +66,7 @@ if ! env -u APPIMAGE "${PYTHON_BIN}" -c "import numpy, gptcache" >/dev/null 2>&1
   exit 1
 fi
 
-DRY_RUN="${DRY_RUN:-no}"
+DRY_RUN="${DRY_RUN:-yes}"
 CACHE_DIR="${CACHE_DIR:-/tmp/contextcache_data_load_mult_delayed}"
 EXAMPLE_CONFIG="${EXAMPLE_CONFIG:-config/request_gen.example.json}"
 LOAD_ADAPTIVE_RATIO="${LOAD_ADAPTIVE_RATIO:-2.0}"
