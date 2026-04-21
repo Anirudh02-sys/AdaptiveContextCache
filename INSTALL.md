@@ -88,17 +88,66 @@ python -c "import gptcache; print('gptcache version:', getattr(gptcache, '__vers
 ```
 
 
-5) Run the API server to check
---------------------------------------------------
+5) Set up environment variables
+-------------------------------
 
-Run the cache API server:
-
-```bash
-python -m gptcache_server.server -s 127.0.0.1 -p 8011 -d /tmp/contextcache_data
-```
-
-Health check:
+Create a `.env` file in the repo root with your API credentials:
 
 ```bash
-curl -s http://127.0.0.1:8011/
+VOCAREUM_API_KEY="your-api-key-here"
+OPENAI_API_BASE="https://genai.vocareum.com/v1"
 ```
+
+Or for standard OpenAI:
+
+```bash
+OPENAI_API_KEY="sk-..."
+OPENAI_API_BASE="https://api.openai.com/v1"
+```
+
+Before starting the server, load these into your shell:
+
+```bash
+set -a; source .env; set +a
+```
+
+**Note:** The config file `config/request_gen.test.json` uses `"api_key_env": "VOCAREUM_API_KEY"`.
+If you use a different variable name (e.g. `OPENAI_API_KEY`), update the config to match.
+
+
+6) Run the API server
+---------------------
+
+Start the cache API server with OpenAI-compatible routes enabled:
+
+```bash
+python -m gptcache_server.server -s 127.0.0.1 -p 8012 -d /tmp/contextcache_data -o True
+```
+
+Health check (in another terminal):
+
+```bash
+curl -s http://127.0.0.1:8012/
+```
+
+
+7) Run the request generator (optional)
+---------------------------------------
+
+With the server running, open another terminal and run:
+
+```bash
+source .venv/bin/activate
+set -a; source .env; set +a
+python scripts/generate_requests.py --config config/request_gen.test.json
+```
+
+This sends test requests using data from `test/` and writes metrics to `data/test_apps/`.
+
+
+Troubleshooting
+---------------
+
+- **"No API key provided"**: Ensure you ran `set -a; source .env; set +a` before starting the server.
+- **"Connection refused"**: Check that the server port matches `base_url` in your config JSON.
+- **Dry-run mode**: Add `-dr yes` to the server command to skip real LLM calls (useful for testing cache logic only).

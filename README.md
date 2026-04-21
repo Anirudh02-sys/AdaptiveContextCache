@@ -1,5 +1,53 @@
 # README
 
+## Quick Start
+
+### 1. Install dependencies
+
+See [`INSTALL.md`](INSTALL.md) for full setup. Summary:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+```
+
+### 2. Set environment variables
+
+Create a `.env` file in the repo root:
+
+```bash
+VOCAREUM_API_KEY="your-api-key-here"
+OPENAI_API_BASE="https://genai.vocareum.com/v1"
+```
+
+Load it before running:
+
+```bash
+set -a; source .env; set +a
+```
+
+**Important:** The config `api_key_env` field must match your env variable name.
+
+### 3. Start the server (Terminal 1)
+
+```bash
+source .venv/bin/activate
+set -a; source .env; set +a
+python -m gptcache_server.server -s 127.0.0.1 -p 8012 -d /tmp/contextcache_data -o True
+```
+
+### 4. Run workload generator (Terminal 2)
+
+```bash
+source .venv/bin/activate
+set -a; source .env; set +a
+python scripts/generate_requests.py --config config/request_gen.test.json
+```
+
+---
+
 ## Usage
 
 **Run the server:** From the repository root (where `setup.py` lives), start the process with any of the flags in the table below:
