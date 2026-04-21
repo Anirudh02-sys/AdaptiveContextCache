@@ -85,21 +85,9 @@ This section describes the major functions of our source code and where they are
 
 - **`scripts/repro_dry_window_activation.sh`** — Reproducibility script for a delayed-load dry-run experiment that highlights adaptive context-window transitions.
 
-### 3. Plotting and Analysis
+### 3. Plotting Scripts
 
-- **`scripts/plot_request_metrics.py`** — Plots latency, accuracy, and SLO attainment from one run.
-
-- **`scripts/compare_experiments.py`** — Compares multiple experiment runs.
-
-- **`scripts/compare_experiments_avg.py`** — Produces averaged comparisons across applications or load levels.
-
-- **`scripts/plot_delayed_experiment_timeseries.py`** — Plots time-series metrics such as effective context window, requests per minute, tokens per minute, and accuracy.
-
-- **`scripts/plot_latency_breakdown_ablation.py`** — Plots latency component breakdowns from timing logs.
-
-- **`scripts/plot_window_factor_ablation.py`** — Plots how the final context window is composed from base window, load adaptation, and SLO offsets.
-
-- **`scripts/plot_experiment_results.sh`** — Shell wrapper for regenerating saved plots.
+Additional plotting utilities are included in `scripts/` for visualizing experiment metrics and reproducing figures.
 
 ### 4. Data Preparation
 
