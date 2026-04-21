@@ -16,9 +16,6 @@ from gptcache.utils import import_openai
 from gptcache.utils.cache_func import cache_all
 from gptcache.utils.adaptive_window import LoadAdaptiveContextController
 from gptcache.utils.log import gptcache_log
-from gptcache.processor.context.summarization_context import (
-    SummarizationContextProcess,
-)
 
 class Cache:
     """GPTCache core object.
@@ -47,6 +44,19 @@ class Cache:
         self.report = Report()
         self.next_cache = None
         self._load_adaptive_controller: Optional[LoadAdaptiveContextController] = None
+        self._input_summarizer = None
+
+    @property
+    def input_summarizer(self):
+        if self._input_summarizer is None:
+            # Summarization is optional and should only load heavy HF/Torch deps
+            # when input summarization is actually used.
+            from gptcache.processor.context.summarization_context import (
+                SummarizationContextProcess,
+            )
+
+            self._input_summarizer = SummarizationContextProcess()
+        return self._input_summarizer
 
     def init(
         self,
@@ -83,7 +93,6 @@ class Cache:
         self.post_process_messages_func = post_func if post_func else post_process_messages_func
         self.config = config
         self.next_cache = next_cache
-        self.input_summarizer = SummarizationContextProcess()
         if config.load_adaptive:
             self._load_adaptive_controller = LoadAdaptiveContextController(self)
 

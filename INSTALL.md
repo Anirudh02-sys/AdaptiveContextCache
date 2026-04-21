@@ -72,6 +72,14 @@ python -m pip install -r requirements.txt
 python -m pip install -e .
 ```
 
+Optional: install PyTorch only if you plan to use the input summarizer or other
+torch-backed embedding/model adapters. On WSL or CPU-only machines, prefer the
+CPU wheels unless you have a matching CUDA runtime configured:
+
+```bash
+python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
+```
+
 Sanity check import:
 
 ```bash
@@ -92,4 +100,4 @@ Health check:
 
 ```bash
 curl -s http://127.0.0.1:8011/
-`
+```

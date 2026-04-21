@@ -2,8 +2,15 @@
 numpy>=1.21,<2
 # v5 removed summarization / text2text-generation pipelines used by the context summarizer.
 transformers>=4.30,<5
-# Context summarizer (BART) and transformer models need a PyTorch runtime (CPU wheels on PyPI; use pytorch.org for CUDA).
-torch>=2.0
+# Base local embedding/server runtime used by INSTALL.md.
+onnxruntime
+faiss-cpu
+sqlalchemy
+fastapi
+uvicorn[standard]
+pydantic
+openai==0.28.1
+# Install torch separately when using summarization or torch-backed models.
 cachetools
 requests
 matplotlib
