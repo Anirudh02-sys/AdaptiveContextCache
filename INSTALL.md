@@ -11,6 +11,7 @@ and scripts.
 
 - Linux is the primary target (these steps assume Ubuntu/Debian).
 - Python version required: >= 3.8.1 
+- Slight Modifications may be needed based on Python version
 
 
 1) System prerequisites (Ubuntu/Debian)
