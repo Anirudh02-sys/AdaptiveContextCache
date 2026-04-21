@@ -1,690 +1,364 @@
-# ContextCache
+# README
 
-ContextCache is a context-aware semantic caching system built on top of GPTCache-like primitives.
-It is designed for multi-turn conversations where query meaning depends on dialogue history.
+## Usage
 
-This repository currently exposes:
+**Run the server:** From the repository root (where `setup.py` lives), start the process with any of the flags in the table below:
 
-- a local cache API server (`/put`, `/get`, `/flush`, `/cache_file`),
-- an optional OpenAI-compatible proxy route (`/v1/chat/completions`),
-- context-aware matching logic in the adapter layer.
+```bash
+cd /path/to/AdaptiveContextCache
+python -m gptcache_server.server -s 127.0.0.1 -p 8012 -d /tmp/contextcache_data -o True
+```
 
-Demo video: <https://youtu.be/R3NByaQS7Ws>
+Append any additional flags from the table below (for example `--load-adaptive`, `-m adaptivecontextcache`, `--dry-run yes`).
+
+### Cache server CLI
+
+| Flag | Meaning |
+|------|--------|
+| `-s` / `--host` | Bind host (default `localhost`). |
+| `-p` / `--port` | Listen port (default `8000`). |
+| `-d` / `--cache-dir` | On-disk cache data directory. |
+| `-k` / `--cache-file-key` | Optional cache file key. |
+| `-f` / `--cache-config-file` | YAML/JSON cache init file (optional). |
+| `-o` / `--openai` | Enable OpenAI-compatible routes (e.g. `/v1/chat/completions`). |
+| `-of` / `--openai-cache-config-file` | Separate cache config for the OpenAI proxy cache instance. |
+| `-dr` / `--dry-run` | `yes` or `no`: if `yes`, upstream LLM calls can be suppressed for testing. |
+| `-cw` / `--context-cache-window-len` | Base dialogue embedding window length for context matching (default `5`; overrides config from `-f` when set). |
+| `-m` / `--server-mode` | `no-cache`, `gptcache`, `contextcache`, or `adaptivecontextcache`. |
+| `--load-adaptive` | Enable per-minute load tracking and adjust the effective context window via `context_cache_overall_factor` (see **Source code map**). |
+| `--load-adaptive-ratio` | `R` must be greater than 1: shrink window when load ≥ R× the previous minute; grow when load ≤ 1/R× (default `2.0`). |
+| `--slo-adaptive` | When set, enables SLO-driven per-application context-window factors when application SLOs are registered (see HTTP API below). |
+
+**Core networking and storage:** `--host` / `--port` control where **uvicorn** listens. `--cache-dir` is the working directory for persisted cache state; `--cache-file-key` and `--cache-config-file` let you use file-based or YAML-driven initialization instead of all-defaults. **`--dry-run yes`** avoids calling real upstream LLMs where the adapter supports it—useful when only cache behavior matters.
+
+**OpenAI proxy:** `-o` / `--openai` turns on routes such as **`/v1/chat/completions`**. If you need different storage or evaluation stacks for the “raw” cache API versus the OpenAI shim, pass **`-of`** with a second cache config.
+
+**Context window:** **`-cw`** sets the **base** `context_cache_window_len` used everywhere the effective window is computed (before per-app and load factors). It overrides the value embedded in a config file from **`-f`**.
+
+**Load adaptation:** With **`--load-adaptive`**, each request (via the OpenAI adapter) feeds **token and request counts** into **`LoadAdaptiveContextController`**. Once per minute, the controller compares the sliding window to the **previous** minute; if traffic grew by at least **`--load-adaptive-ratio`** it **shrinks** the effective window (favoring cheaper, cache-friendly paths), and if traffic dropped by the inverse ratio it **grows** the window (up to **`context_cache_window_max`** in config). This keeps the dialogue window responsive to load without manual restarts.
+
+**SLO adaptation:** With **`--slo-adaptive`**, **`on_application_registry_changed()`** recomputes **per-application additive offsets** `context_cache_window_delta_by_app` from the **latency** and **accuracy** targets stored for each server-issued application id. Stricter latency goals bias toward **negative** deltas (shorter effective windows, more aggressive caching); stricter accuracy goals bias toward **positive** deltas (longer windows, richer context). When the flag is off, every app delta stays at **0** regardless of registrations.
+
+Clients register targets with:
+
+- **`POST /v1/applications`** — JSON body with **`latency_p99_ms`** and **`accuracy_slo`** (same semantics as `application_slo_expectations` in the request generator). The server returns a new **`application_id`** (UUID string).
+- **`DELETE /v1/applications/{application_id}`** — drop that app’s SLO record and recompute factors.
+
+(Request/response **Pydantic** models live in [`gptcache_server/server.py`](gptcache_server/server.py).)
+
+## Major Functions and Source Code Organization
+
+This section describes the major functions of our source code and where they are implemented. The primary focus of this project is the load-adaptive and SLO-adaptive extensions to ContextCache.
+
+### 1. Core Adaptive Cache Implementation (Main Contribution)
+
+- **`gptcache_server/server.py`** — Main server entry point and adaptive feature control.
+  - `main()` parses command-line arguments, initializes the cache, selects the server mode, and starts the HTTP server.
+  - `on_application_registry_changed()` recomputes per-application context-window offsets when SLO registrations change.
+  - `register_application_slo` adds a new application's latency and accuracy targets.
+  - `deregister_application` removes an application's registration and refreshes active offsets.
+
+- **`gptcache/utils/adaptive_window.py`** — Implements load-adaptive context-window logic.
+  - `LoadAdaptiveMinuteWindow` tracks recent request counts and token counts over a sliding time window.
+  - `LoadAdaptiveContextController` compares recent load against the previous interval and shrinks or expands the effective context window.
+
+- **`gptcache/config.py`** — Defines adaptive configuration and runtime window computation.
+  - `Config` stores the base context window, global adaptive factor, per-application offsets, and adaptive feature flags.
+  - `effective_context_window_len(application_id)` computes the final context window used for a request by combining the base window, load-adaptive global factor, and per-application SLO offset.
+
+- **`gptcache/adapter/adapter.py`** — Existing ContextCache retrieval path; in this fork, it was modified to apply `effective_context_window_len(application_id)` during cache matching.
+
+- **`gptcache/adapter/openai.py`** — Existing model-compatible request path; in this fork, it was modified to forward request load statistics to the adaptive controller when enabled.
+
+### 2. Experiment Drivers (Evaluation of Load / SLO Changes)
+
+- **`scripts/generate_requests.py`** — Main workload generator.
+  - Loads application workload files.
+  - Replays multi-turn requests against the server.
+  - Records latency, cache hits, accuracy metrics, and SLO attainment.
+
+- **`scripts/run_experiments.sh`** — Runs baseline comparisons across cache modes.
+
+- **`scripts/run_load_multiplier_experiments.sh`** — Main load-scaling evaluation script that compares system behavior under different workload intensities.
+
+- **`scripts/run_lm10_load_slo_adaptive_experiments.sh`** — Runs focused experiments combining load-adaptive and SLO-adaptive behavior.
+
+- **`scripts/repro_dry_window_activation.sh`** — Reproducibility script for a delayed-load dry-run experiment that highlights adaptive context-window transitions.
+
+### 3. Plotting and Analysis
+
+- **`scripts/plot_request_metrics.py`** — Plots latency, accuracy, and SLO attainment from one run.
+
+- **`scripts/compare_experiments.py`** — Compares multiple experiment runs.
+
+- **`scripts/compare_experiments_avg.py`** — Produces averaged comparisons across applications or load levels.
+
+- **`scripts/plot_delayed_experiment_timeseries.py`** — Plots time-series metrics such as effective context window, requests per minute, tokens per minute, and accuracy.
+
+- **`scripts/plot_latency_breakdown_ablation.py`** — Plots latency component breakdowns from timing logs.
+
+- **`scripts/plot_window_factor_ablation.py`** — Plots how the final context window is composed from base window, load adaptation, and SLO offsets.
+
+- **`scripts/plot_experiment_results.sh`** — Shell wrapper for regenerating saved plots.
+
+### 4. Data Preparation
+
+- **`scripts/extract_sharegpt.py`** — Cleans and extracts ShareGPT conversations into normalized datasets.
+
+- **`scripts/preprocess.py`** — Builds warmup, evaluation, and application-partitioned datasets used by experiments.
+
+### 5. Additional Topic-Drift Scripts
+
+These scripts support an optional stretch-goal analysis and are secondary to the main adaptive cache contribution.
+
+- **`scripts/drift_utils.py`** — Shared utilities for drift experiments.
+- **`scripts/mark_drift.py`** — Labels conversations by drift level.
+- **`scripts/build_candidate_pool.py`** — Builds retrieval candidate pools.
+- **`scripts/drift_window_eval.py`** — Evaluates retrieval across different history windows.
+- **`scripts/plot_window_metrics.py`** — Plots drift evaluation results.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--
+ ### Experiment and evaluation scripts
+
+#### [`scripts/run_experiments.sh`](scripts/run_experiments.sh)
+
+Orchestrates one or more **cache-mode experiments** against a locally started `gptcache_server`. For each run, `run_experiment` clears `CACHE_DIR`, builds a **temporary JSON** from [`config/request_gen.example.json`](config/request_gen.example.json) with `jq` (injecting `output_metrics_path`, `output_request_log_path`, and accuracy-baseline fields), starts the server in the background with `--server-mode` and any extra flags (for example `--slo-adaptive`), waits until the HTTP port responds, then invokes **`scripts/generate_requests.py`** with that config. After the run it stops the server, runs **`plot_request_metrics.py`** on the new metrics, and writes per-run plots under `data/test_apps/example/plots/<suffix>/` by default. A final step can call **`compare_experiments.py`** to merge multiple `request_metrics_*.json` files into comparison charts. **Environment:** `DRY_RUN`, `CACHE_DIR`, `PYTHON`, plus API credentials for the backend (see below). Individual baseline modes may be commented or uncommented in the script depending on which experiments you want to regenerate.
+
+#### [`scripts/run_load_multiplier_experiments.sh`](scripts/run_load_multiplier_experiments.sh)
+
+Same overall pattern as `run_experiments.sh`, but **sweeps `load_multiplier`** (for example 1 and 10) in the patched request-gen config, keeps artifacts under **`data/test_apps/load_mult_compare/`**, and uses **`--load-adaptive`** on the fourth mode instead of `--slo-adaptive`. **Environment:** `LOAD_ADAPTIVE_RATIO`, `EXAMPLE_CONFIG`, plus the same variables as the main experiment driver.
+
+#### [`scripts/generate_requests.py`](scripts/generate_requests.py) — `main()` and `run(config)`
+
+**`main()`** parses **`--config`**, loads the JSON, calls **`run(config)`**, and writes the returned metrics object to `output_metrics_path` when set, also printing JSON to stdout. **`run(config)`** is the core workload: it loads per-application conversation JSONL from `data_dir`, optionally runs a **warmup** phase that sends chat requests to the server to populate the cache, then spawns worker threads per **application** with configurable delays, jitter, concurrency, and optional time limits. It records per-request latency, cache hit/miss flags, accuracy metrics (token F1, sequence ratio, exact match) against gold or baseline logs, and **SLO attainment** against `application_slo_expectations` in the config. Aggregates are written into a single metrics structure (including `per_application` and overall throughput/latency percentiles).
+
+#### Plotting and comparison
+
+- **[`scripts/plot_request_metrics.py`](scripts/plot_request_metrics.py)** — Reads one **metrics JSON** produced by `generate_requests.py` and writes PNG charts (latency distributions, accuracy, SLO bars, etc.) under `--output-dir` with an optional filename `--prefix`. Use this to visualize a **single** experimental run.
+
+- **[`scripts/compare_experiments.py`](scripts/compare_experiments.py)** — Loads **several** runs (via repeated `--run KEY:path/to/request_metrics.json[:optional_log.jsonl]` or legacy `--metrics-*` arguments), aligns them by application id, and emits **comparison** figures (for example latency and SLO attainment side-by-side). Request logs can be inferred from metrics filenames when the naming convention `request_metrics_<suffix>.json` / `request_log_<suffix>.jsonl` is followed.
+
+- **[`scripts/plot_experiment_results.py`](scripts/plot_experiment_results.py)** — Convenience wrapper that regenerates **both** per-run plots (delegating to `plot_request_metrics.py`) and comparison plots (delegating to `compare_experiments.py`) from existing artifacts, without starting the server. Supports `--include` to filter which run keys appear on comparison charts and optional `--request-gen-config` for supplementary SLO/workload figures when the corresponding helper script is present.
+
+#### Data preparation (optional)
+
+- **[`scripts/extract_sharegpt.py`](scripts/extract_sharegpt.py)** — Filters and cleans raw ShareGPT-style dumps into normalized JSONL suitable for downstream splitting (language, turn counts, length limits).
+
+- **[`scripts/preprocess.py`](scripts/preprocess.py)** — Splits cleaned JSONL into warmup/eval portions, **embeds** conversations, **clusters** them into synthetic “applications,” and writes **`application_*.jsonl`** plus manifests under `data/` for use with `generate_requests.py`.
+
+### Small sample data under `test/`
+
+The smallest runnable **application JSONL** bundle for quick experiments lives under **[`test/`](test/)**. 
+
+| Path | Contents |
+|------|----------|
+| [`test/`](test/) | Five apps: `application_00.jsonl` … `application_04.jsonl`, warmup `mt10_warmup_5.jsonl`, `manifest.json`. Matches [`config/request_gen.test.json`](config/request_gen.test.json) (`data_dir`: `test/`, `warmup_file`: `mt10_warmup_5.jsonl`, `file_glob`: `application_*.jsonl`). |
+
+
+[`config/request_gen.test.json`](config/request_gen.test.json) matches the `test/` layout above (five apps; experiment length and limits are set in that JSON).
+
+Below is an **example** to run our code: run the server in one shell, then the request generator in another.
+
+- **Server command:**
+
+```bash
+python3 -m gptcache_server.server --server-mode contextcache --slo-adaptive --load-adaptive
+```
+
+- **Requests command:**
+
+```bash
+python3 scripts/generate_requests.py --config config/request_gen.test.json
+```
+
+
+### API keys and backends
+
+Request-gen JSON uses `api_key_env` (name of an environment variable holding the API key) and `base_url` for the chat backend. Export those variables in your shell before running scripts; do not commit real keys. Align `base_url` and model names with your provider.
 
 ---
 
-## Table of Contents
+## Source code map
 
-- [What this project does](#what-this-project-does)
-- [Repository structure](#repository-structure)
-- [How request processing works](#how-request-processing-works)
-- [Requirements](#requirements)
-- [Install](#install)
-- [Run the server](#run-the-server)
-- [API usage](#api-usage)
-- [OpenAI proxy mode](#openai-proxy-mode)
-- [Python API usage](#python-api-usage)
-- [Worker script for turn-by-turn conversations](#worker-script-for-turn-by-turn-conversations)
-- [ShareGPT preprocessing for experiments](#sharegpt-preprocessing-for-experiments)
-- [Multithreaded request generator](#multithreaded-request-generator)
-- [Configuration details](#configuration-details)
-- [Context input format](#context-input-format)
-- [Observability and reporting](#observability-and-reporting)
-- [Troubleshooting](#troubleshooting)
-- [Known limitations of this branch](#known-limitations-of-this-branch)
+The entries below focus on **new or substantially changed** pieces in this fork (baseline commit `a0fc5a9`, message `demo_update`). For shell-based orchestration and `generate_requests.py` behavior, see **Experiment and evaluation scripts** under Usage.
+
+### [`gptcache/utils/adaptive_window.py`](gptcache/utils/adaptive_window.py)
+
+#### `LoadAdaptiveMinuteWindow`
+
+Maintains a **thread-safe sliding time window** (default 60 seconds) of `(timestamp, request_count, input_token_count)` events. **`record_request(input_tokens)`** appends an event for the current time and drops events older than the window. **`counts_in_window()`** returns the total number of requests and total input tokens still inside the window after pruning. This is the low-level signal used to approximate “current minute” load.
+
+#### `LoadAdaptiveContextController`
+
+Owns a `LoadAdaptiveMinuteWindow` and a **`Cache`** instance. **`record_request(input_tokens)`** forwards counts into the window; **once per window interval** (aligned with `window_seconds`), it compares the **current** window totals to **previous** minute snapshots (`_prev_req`, `_prev_tok`) and calls **`_maybe_resize_context_window`**. That helper uses `load_adaptive_ratio` (R) from config: if requests or tokens grew by at least **R×** versus the prior minute it treats load as **high** and tries to **shrink** the effective dialogue window by one step (down to 1); if both signals fell to at most **1/R×** it treats load as **low** and tries to **grow** by one step (up to `context_cache_window_max`). It implements shrink/grow by updating **`context_cache_overall_factor`** so that `effective_context_window_len(None)` matches the new integer length relative to the base `context_cache_window_len`. **`minute_counts()`** exposes the latest sliding-window totals for diagnostics.
 
 ---
 
-## What this project does
+### [`gptcache_server/server.py`](gptcache_server/server.py)
 
-At a high level:
+#### `main()`
 
-1. Preprocess incoming prompt/messages.
-2. Build embeddings and search top-k candidate cache items.
-3. Filter by current-query similarity threshold.
-4. Re-rank with dialogue context similarity (`mean` mode by default).
-5. Return cached answer on hit, otherwise call miss path and store result.
+Parses CLI arguments, initializes **`cache`** (and optionally a second **`openai_cache`**) via `init_similar_cache` / `init_similar_cache_from_config`, copies **`Config`** fields from flags (`context_cache_window_len`, `load_adaptive`, `load_adaptive_ratio`, `slo_adaptive`), sets globals **`server_mode`** and **`dry_run`**, and starts **uvicorn** on `--host` / `--port`. When `--openai` is set, wires the OpenAI-compatible chat route against the appropriate cache instance.
 
-The core orchestration lives in `gptcache/adapter/adapter.py` (`adapt()`).
+#### `on_application_registry_changed()`
 
----
+Runs whenever the in-memory registry of application SLOs changes. If **`slo_adaptive`** is off, it sets **per-app deltas to 0** (neutral). If on, it reads **`_application_slos`** (latency and accuracy targets per server-issued application id), **normalizes** strictness scores, and computes a **bounded integer turn offset per app** (latency-tight apps get negative deltas for shorter context windows, accuracy-tight apps get positive deltas for longer ones). It writes the result into **`cache.config.context_cache_window_delta_by_app`** (and `openai_cache` when present).
 
-## Repository structure
+#### `register_application_slo` (`POST /v1/applications`)
 
-- `gptcache/`
-  - `core.py` - `Cache` object initialization and lifecycle.
-  - `config.py` - runtime config (thresholds, context state, flags).
-  - `adapter/`
-    - `adapter.py` - main hit/miss orchestration.
-    - `api.py` - helper APIs (`init_similar_cache`, `put`, `get`).
-    - `openai.py` - OpenAI wrapper (`ChatCompletion`, etc.).
-  - `manager/` - scalar/vector/object storage + eviction.
-  - `processor/` - pre/post/context processing.
-  - `similarity_evaluation/` - ranking/evaluation strategies.
-  - `report.py` - per-operation counters/timing.
-- `gptcache_server/server.py` - FastAPI server and CLI entrypoint.
-- `setup.py` - package metadata and `gptcache_server` console command.
-- `requirements.txt` - base minimal dependencies.
+Validates **`latency_p99_ms`** (positive) and **`accuracy_slo`** in `[0, 1]`, assigns a new **`uuid4`** string as **`application_id`**, stores the record under **`_application_slos`**, and calls **`on_application_registry_changed()`**. Clients use the returned id when tagging traffic if the workload supports it.
+
+#### `deregister_application` (`DELETE /v1/applications/{application_id}`)
+
+Removes an entry from **`_application_slos`** and recomputes factors.
+
+#### Legacy cache routes
+
+**`hello`**, **`put_cache`**, **`get_cache`**, **`flush_cache`** expose the original simple put/get/flush API on the primary **`cache`** object.
 
 ---
 
-## How request processing works
+### [`gptcache/config.py`](gptcache/config.py) — `Config` and `effective_context_window_len`
 
-### 1) Preprocess
-`pre_embedding_func` extracts a cache key source from request payload.  
-Examples:
-- `get_prompt` for simple `{"prompt": "..."}`
-- `last_content` for chat messages
-
-### 2) Embed + retrieve candidates
-`embedding_func` builds vectors; `data_manager.search()` returns nearest candidates.
-
-### 3) Score candidates
-The branch uses:
-- query similarity threshold (`similarity_threshold`)
-- dialogue/context threshold (`dialuoge_threshold`)
-- context combination mode (`method`, default `mean`)
-
-### 4) Hit path
-If a candidate passes thresholds:
-- post-process selected answer,
-- return cached response,
-- update report counters.
-
-### 5) Miss path
-If no candidate qualifies:
-- call `llm_handler` (or no-op handler depending on API path),
-- store answer + embedding + context in cache.
+**`Config`** adds fields for **base** window length **`context_cache_window_len`**, **overall** multiplier **`context_cache_overall_factor`**, optional **per-application additive-offset** map **`context_cache_window_delta_by_app`**, cap **`context_cache_window_max`**, and booleans **`load_adaptive`**, **`load_adaptive_ratio`**, **`slo_adaptive`**. **`effective_context_window_len(application_id)`** computes `round(N * overall) + app_delta` with `app_delta` defaulting to 0 when the id is missing, then **clamps** the result to `[1, context_cache_window_max]`. Dialogue-window truncation in the cache path uses this value rather than raw `N`.
 
 ---
 
-## Requirements
+### [`gptcache/core.py`](gptcache/core.py) — `Cache`
 
-- Python `>= 3.8.1` (`setup.py`)
-- Linux/macOS recommended
-- Network access for optional OpenAI mode
+#### `init(...)`
 
-Notes:
+If **`config.load_adaptive`** is true, constructs **`LoadAdaptiveContextController(self)`** at init time so load statistics are ready before the first request.
 
-- `requirements.txt` is intentionally small (`numpy` pinned to 1.x for `onnxruntime` compatibility, `transformers` pinned to 4.x for summarization pipelines, `torch` for those models, `cachetools`, `requests`).
-- Several optional packages are loaded lazily and can be auto-installed on first use (for example FastAPI/uvicorn/openai/onnxruntime/faiss).
+#### `record_load_adaptive_request(input_tokens)`
 
----
+No-op when `load_adaptive` is false; otherwise lazily creates **`LoadAdaptiveContextController`** if needed and forwards to **`record_request`**, updating minute load and possibly **`context_cache_overall_factor`**.
 
-## Install
+#### `load_adaptive_minute_stats()`
 
-From repo root:
+Returns **`(requests, tokens)`** for the current sliding minute, or **`None`** if load adaptation is disabled.
 
-```bash
-cd ContextCache
-python3 -m pip install -U pip
-python3 -m pip install -e .
-```
+#### `import_data(...)`
 
-Alternative (package-only usage):
-
-```bash
-python3 -m pip install gptcache
-```
+For list-shaped “dialogue” questions, trims stored context embedding lists to **`effective_context_window_len(None)`** so bulk imports stay consistent with runtime behavior.
 
 ---
 
-## Run the server
+### Adapters and client
 
-### Basic cache server
+#### [`gptcache/adapter/adapter.py`](gptcache/adapter/adapter.py)
 
-```bash
-python3 -m gptcache_server.server -s 127.0.0.1 -p 8011 -d /tmp/contextcache_data
-```
+Where dialogue turns are turned into embedding sequences for context matching, the code uses **`effective_context_window_len(application_id)`** (when an application id is available) so **hit/miss decisions** respect the same dynamic window as storage and load adaptation.
 
-Equivalent console entrypoint after install:
+#### [`gptcache/adapter/openai.py`](gptcache/adapter/openai.py)
 
-```bash
-gptcache_server -s 127.0.0.1 -p 8011 -d /tmp/contextcache_data
-```
+After estimating **input token count** for an incoming chat request, if **`load_adaptive`** is enabled on the active cache it calls **`record_load_adaptive_request`** so the **LoadAdaptiveContextController** observes production traffic.
 
-### Health check
+#### [`gptcache/adapter/api.py`](gptcache/adapter/api.py)
 
-```bash
-curl -s http://127.0.0.1:8011/
-```
+Small changes so **`init_similar_cache`** / config loading paths pass through the extended **`Config`** fields used by this fork.
 
-Expected:
+#### [`gptcache/adapter/adapter_bac.py`](gptcache/adapter/adapter_bac.py)
 
-```json
-"hello gptcache server"
-```
+Alternate or backup adapter implementations kept for **experiments and A/B** against the main **`adapt()`** path.
+
+#### [`gptcache/client.py`](gptcache/client.py)
+
+Adjustments to the lightweight HTTP client helpers so they remain compatible with **server modes**, headers, and response shapes used in evaluation.
 
 ---
 
-## API usage
+### Embeddings and context preprocessing (delta)
 
-### Insert (`/put`)
+#### [`gptcache/embedding/onnx.py`](gptcache/embedding/onnx.py) / [`gptcache/similarity_evaluation/onnx.py`](gptcache/similarity_evaluation/onnx.py)
 
-```bash
-curl -s -X POST http://127.0.0.1:8011/put \
-  -H "Content-Type: application/json" \
-  -d '{"prompt":"hello","answer":"world"}'
-```
+Updates to **ONNX Runtime** embedding and evaluation paths (model loading, tensor layout, error handling) so semantic cache and similarity stages work reliably with the versions pinned in **`requirements.txt`**.
 
-Expected:
+#### [`gptcache/processor/context/summarization_context.py`](gptcache/processor/context/summarization_context.py)
 
-```json
-"successfully update the cache"
-```
-
-### Retrieve (`/get`)
-
-```bash
-curl -s -X POST http://127.0.0.1:8011/get \
-  -H "Content-Type: application/json" \
-  -d '{"prompt":"hello"}'
-```
-
-Expected:
-
-```json
-{"prompt":"hello","answer":"world"}
-```
-
-### Flush
-
-```bash
-curl -s -X POST http://127.0.0.1:8011/flush
-```
-
-### Download cache files (if key set at startup)
-
-```bash
-curl -L "http://127.0.0.1:8011/cache_file?key=<your-key>" -o cache.zip
-```
+Tweaks to **summarization** helpers used when long turns are compressed before embedding, keeping behavior aligned with longer multi-turn traces in experiments.
 
 ---
 
-## OpenAI proxy mode
+### Additional automation scripts (reference)
 
-Enable OpenAI-compatible chat completion endpoint:
+#### [`scripts/run_adaptive_micro_eval.sh`](scripts/run_adaptive_micro_eval.sh)
 
-```bash
-env -u APPIMAGE /usr/bin/python3 -m gptcache_server.server \
-  -s 127.0.0.1 -p 8012 \
-  -d /tmp/contextcache_data \
-  -o True
-```
+Runs a **paired micro-benchmark**: same workload twice against a live server—**contextcache** without `--load-adaptive`, then **`adaptivecontextcache`** with **`--load-adaptive`**. Each arm typically includes a **low-load** phase and a **high-load** burst so **`LoadAdaptiveContextController`** can react. Outputs land under `data/test_apps/adaptive_micro_eval/` (configurable). Tunables include **`PORT`**, **`LOW_DURATION_S` / `HIGH_DURATION_S`**, **`LOW_MULTIPLIER` / `HIGH_MULTIPLIER`**, **`LOAD_ADAPTIVE_RATIO`**, **`CONTEXT_WINDOW_LEN`**, and **`DRY_RUN`**.
 
-### Server modes
+#### [`scripts/run_app_window_factor_micro_eval.sh`](scripts/run_app_window_factor_micro_eval.sh)
 
-The chat proxy supports a `--server-mode` runtime option:
+A heavier **async Python harness** (embedded heredoc) that compares **no-cache**, **contextcache without SLO adaptation**, and **contextcache with SLO adaptation**, using **asymmetric** synthetic workloads (**latency-sensitive** vs **accuracy-sensitive** templates). Optional **grid search** over base window, overall factor, and max window tests how **`context_cache_window_delta_by_app`** interacts with accuracy and latency; results can be written under a configurable **`RESULTS_DIR`**.
 
-- `contextcache` (default): current context-aware two-stage filtering.
-- `gptcache`: query-only semantic cache behavior, no dialogue-history gate.
-- `no-cache`: bypass cache entirely and forward every request to OpenAI.
+#### [`scripts/plot_experiment_results.sh`](scripts/plot_experiment_results.sh)
 
-ContextCache mode example:
+Thin shell wrapper around **`plot_experiment_results.py`** for the same arguments as in interactive use.
 
-```bash
-env -u APPIMAGE /usr/bin/python3 -m gptcache_server.server \
-  -s 127.0.0.1 -p 8012 \
-  -d /tmp/contextcache_data \
-  -o True \
-  --server-mode contextcache
-```
+#### [`scripts/compare_experiments.py`](scripts/compare_experiments.py) — `parse_args`, `load_experiment_runs`, `write_comparison_plots`
 
-GPTCache mode example:
+**`load_experiment_runs`** resolves each **`--run`** into metrics plus optional request logs, loads JSON, and builds **`ExperimentRun`** rows. **`write_comparison_plots`** renders the cross-run **latency / accuracy / SLO** figures. Legacy flags map fixed filenames for older three-way comparisons.
 
-```bash
-env -u APPIMAGE /usr/bin/python3 -m gptcache_server.server \
-  -s 127.0.0.1 -p 8012 \
-  -d /tmp/contextcache_data \
-  -o True \
-  --server-mode gptcache
-```
+#### [`scripts/plot_request_metrics.py`](scripts/plot_request_metrics.py)
 
-No-cache mode example:
+Loads a single metrics JSON, extracts **`per_application`** statistics, and saves multiple **matplotlib** figures (latency percentiles, SLO attainment, etc.).
 
-```bash
-env -u APPIMAGE /usr/bin/python3 -m gptcache_server.server \
-  -s 127.0.0.1 -p 8012 \
-  -d /tmp/contextcache_data \
-  -o True \
-  --server-mode no-cache
-```
+#### [`scripts/plot_experiment_results.py`](scripts/plot_experiment_results.py) — `main`
 
-Route exposed:
+Subprocess-invokes **`plot_request_metrics.py`** once per run and **`compare_experiments.py`** once for the combined set; optionally invokes **`visualize_app_slos_and_workload.py`** when present.
 
-- `POST /v1/chat/completions`
+#### [`scripts/preprocess.py`](scripts/preprocess.py) — `main` pipeline
 
-Example request:
+Loads cleaned JSONL, performs **train/warmup/eval splits**, **embeds** text with sentence-transformers, **clusters** rows into **`num_applications`** buckets, and writes **`application_<id>.jsonl`** files plus **`manifest.json`** for the request generator.
 
-```bash
-curl -s -X POST http://127.0.0.1:8012/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $OPENAI_API_KEY" \
-  -d '{
-    "model":"gpt-3.5-turbo",
-    "messages":[{"role":"user","content":"What is a relational database?"}],
-    "temperature":0
-  }'
-```
+#### [`scripts/extract_sharegpt.py`](scripts/extract_sharegpt.py) — CLI pipeline
 
-Verify key is set before calling:
-
-```bash
-python3 - <<'PY'
-import os
-k = os.getenv("OPENAI_API_KEY")
-print("OPENAI_API_KEY", "set" if k else "missing")
-PY
-```
-
-Behavior:
-
-- Cache hit: returns cached response.
-- Cache miss: routed through OpenAI adapter path.
-- You can force miss with `"cache_skip": true` or include `/cache_skip` marker in message content.
-
-Important:
-
-- This mode requires a valid OpenAI key and working OpenAI SDK environment.
-- The server extracts key from `Authorization: Bearer ...`.
+Filters ShareGPT dumps (language, turns, length), normalizes fields, and emits **cleaned JSONL** for **`preprocess.py`**.
 
 ---
 
-## Python API usage
+### Configuration examples
 
-Minimal script:
+#### [`config/request_gen.example.json`](config/request_gen.example.json)
 
-```python
-from gptcache.adapter.api import init_similar_cache, put, get
-from gptcache.processor.pre import get_prompt
+Full **multi-app** experiment template: **`data_dir`**, **`warmup_file`**, threading, **`load_multiplier`**, duration, per-app SLO targets, accuracy mode, and output paths for metrics and logs.
 
-init_similar_cache(data_dir="/tmp/api_cache", pre_func=get_prompt)
-put("hello", "world")
-print(get("hello"))  # world
-```
+#### [`config/request_gen.live_test.json`](config/request_gen.live_test.json)
+
+Short **smoke-test** profile: fewer apps, shorter **`experiment_duration_seconds`**, reduced concurrency—use with a **`data_dir`** that already contains **`application_*.jsonl`** (see Usage).
 
 ---
 
-## Worker script for turn-by-turn conversations
+### Packaging and repo metadata
 
-Use `scripts/conversation_cache_worker.py` to send a conversation turn-by-turn while carrying prior turns automatically.
+#### [`INSTALL.md`](INSTALL.md)
 
-### Mode 1: Cache API (`/put` + optional `/get`)
+Step-by-step **OS packages**, **venv**, **`pip install`**, and sanity checks so `gptcache_server` and `scripts/` run in a consistent environment.
 
-```bash
-env -u APPIMAGE /usr/bin/python3 scripts/conversation_cache_worker.py \
-  --mode cache-api \
-  --base-url http://127.0.0.1:8011 \
-  --verify-get
-```
+#### [`requirements.txt`](requirements.txt)
 
-### Mode 2: OpenAI proxy backend
+Pins and adds dependencies (**numpy**, **torch**, **transformers**, **FastAPI**, etc.) required by this branch.
 
-The worker supports both OpenAI-compatible proxy styles:
+#### [`.gitignore`](.gitignore)
 
-- `--proxy-api chat` -> `/v1/chat/completions`
-- `--proxy-api completion` -> `/v1/completions`
-
-Chat endpoint example:
-
-```bash
-env -u APPIMAGE /usr/bin/python3 scripts/conversation_cache_worker.py \
-  --mode chat-proxy \
-  --proxy-api chat \
-  --base-url http://127.0.0.1:8012 \
-  --model gpt-3.5-turbo \
-  --api-key "$OPENAI_API_KEY"
-```
-
-Completion endpoint example:
-
-```bash
-env -u APPIMAGE /usr/bin/python3 scripts/conversation_cache_worker.py \
-  --mode chat-proxy \
-  --proxy-api completion \
-  --base-url http://127.0.0.1:8012 \
-  --model gpt-3.5-turbo \
-  --api-key "$OPENAI_API_KEY"
-```
-
-Dry-run (print payloads without sending HTTP requests):
-
-```bash
-env -u APPIMAGE /usr/bin/python3 scripts/conversation_cache_worker.py \
-  --mode chat-proxy \
-  --proxy-api completion \
-  --dry-run
-```
-
-Use a custom conversation file:
-
-```bash
-env -u APPIMAGE /usr/bin/python3 scripts/conversation_cache_worker.py \
-  --conversation-file /path/to/conversation.json
-```
-
-Conversation JSON format:
-
-```json
-[
-  {"user":"What is a relational database?","assistant":"..."},
-  {"user":"What are its key features?","assistant":"..."}
-]
-```
-
----
-
-## ShareGPT preprocessing for experiments
-
-Use `scripts/preprocess_sharegpt.py` to download a ShareGPT-style dataset, cluster
-conversations into applications, and annotate topic drift.
-
-Default behavior:
-
-- pulls `RyokoAI/ShareGPT52K` from Hugging Face,
-- processes up to `1000` normalized conversations,
-- groups into `--num-applications` clusters,
-- writes `application_XX.jsonl` files and `manifest.json`.
-
-Run for 10 applications:
-
-```bash
-python3 scripts/preprocess_sharegpt.py \
-  --num-applications 10 \
-  --output-dir data
-```
-
-Key output fields per conversation record:
-
-- `application_id`
-- `topic_label`
-- `topic_drift_score`
-- `topic_drift_bucket`
-- `turns`
-- `turn_pairs`
-
----
-
-## Multithreaded request generator
-
-Use `scripts/generate_requests.py` to replay application data with multiple threads
-per application and different per-application request speeds.
-
-Configs:
-
-- `config/request_gen.example.json`
-- `config/request_gen.live_test.json`
-
-Generate synthetic test files for 10 apps:
-
-```bash
-python3 scripts/gen_test_app_data.py --num-apps 10 --out-dir data/test_apps
-```
-
-Start cache proxy first (required for non-dry-run requests):
-
-```bash
-env -u APPIMAGE /usr/bin/python3 -m gptcache_server.server \
-  -s 127.0.0.1 -p 8012 \
-  -d /tmp/contextcache_data \
-  -o True
-```
-
-Quick smoke run (real HTTP requests, shorter duration):
-
-```bash
-python3 scripts/generate_requests.py --config config/request_gen.live_test.json
-```
-
-Experiment/template run (dry-run by default):
-
-```bash
-python3 scripts/generate_requests.py --config config/request_gen.example.json
-```
-
-Notes on run behavior:
-
-- workers randomly sample conversations from each app dataset (sampling with replacement),
-- when `experiment_duration_seconds > 0`, all apps/threads stop at the same global wall-clock end time,
-- if `experiment_duration_seconds` is omitted or `<= 0`, workers fall back to draw-count mode based on per-thread shard size.
-
-Config reference (`config/request_gen.example.json`):
-
-- **Endpoint/model**
-  - `base_url`, `endpoint`, `model`, `api_key_env`
-- **Input data selection**
-  - `data_dir`, `file_glob`, `applications`
-- **Concurrency**
-  - `default_threads_per_app`, `threads_per_application`, `max_workers`
-- **Rate/speed control**
-  - `default_delay_ms`, `app_delay_ms`, `thread_jitter_ms`, `load_multiplier`
-- **Experiment window**
-  - `experiment_duration_seconds` (all workers stop together when duration expires)
-- **Replay limits**
-  - `max_conversations_per_app`, `max_turns_per_conversation`
-- **Reliability**
-  - `retry_count`, `retry_backoff_ms`, `timeout_seconds`
-- **Evaluation and SLO**
-  - `accuracy_enabled`
-  - `accuracy_slo_metric` (`exact_match_rate`, `avg_token_f1`, or `avg_sequence_ratio`)
-  - `application_slo_expectations` per app:
-    - `latency_p99_ms`
-    - `accuracy_slo`
-- **Outputs**
-  - `output_metrics_path`, `output_request_log_path`
-
-SLO reporting behavior:
-
-- per app, the runner reports `slo_target`, `slo_observed`, and `slo_attainment`,
-- latency SLO uses observed `served_p99_latency_ms` (or `p99_latency_ms` if no successful responses),
-- accuracy SLO uses the metric chosen by `accuracy_slo_metric`,
-- top-level `slo_summary` includes total apps with targets, passed apps, and missed apps.
-
-Load multiplier behavior:
-
-- `load_multiplier` scales request pacing globally for all applications and threads,
-- `1.0` keeps configured delays unchanged,
-- values `> 1.0` increase load (faster request generation),
-- values between `0` and `1.0` decrease load (slower request generation),
-- example: `load_multiplier=2.0` makes effective inter-request sleep roughly half.
-
-Notes:
-
-- thread counts are controlled by `default_threads_per_app` and `threads_per_application`,
-- per-app pacing is controlled by `default_delay_ms` and `app_delay_ms`,
-- app conversation selection is random with replacement per worker,
-- each turn includes prior turns from the same conversation only (history resets on next conversation),
-- metrics and optional per-request logs are written to configured output paths,
-- metrics include latency percentiles, cache hits/misses (when returned by proxy), and response-accuracy scores against expected dataset answers (`exact_match_rate`, `avg_token_f1`, `avg_sequence_ratio`),
-- accuracy scoring can be toggled with `accuracy_enabled` in config.
-
----
-
-## Configuration details
-
-Two common initialization styles:
-
-1. Programmatic via `init_similar_cache(...)`
-2. YAML via `init_similar_cache_from_config(...)` and `--cache-config-file`
-
-Key config fields in `Config` (`gptcache/config.py`):
-
-- `similarity_threshold` (default `0.75`) - current query similarity gate.
-- `dialuoge_threshold` (default `0.6`) - context similarity gate.
-- `method` (default `"mean"`) - context ranking method.
-- `auto_flush` - flush period for cache persistence.
-- `enable_token_counter`, `input_summary_len`, `data_check`, `disable_report`.
-
-### Context window sizing (multiplicative global + additive per-app)
-
-ContextCache keeps a fixed **base** window size `context_cache_window_len` (call it \(N\)). The **effective**
-window size used when slicing dialogue-turn embeddings is computed per request:
-
-\[
-W = \mathrm{clamp}_{[1,\,W_{\max}]}\Big(\mathrm{round}\big(N \cdot f_{\text{overall}}\big) + \delta_{\text{app}}\Big)
-\]
-
-Where:
-
-- **Base** \(N\): `context_cache_window_len` (set by server flag `--context-cache-window-len` / YAML config).
-- **Overall factor** \(f_{\text{overall}}\): `context_cache_overall_factor` (starts at `1.0`).
-  - When `load_adaptive` is enabled, the load controller periodically updates this **factor** (not `N`) so the
-    effective window moves by \(\pm 1\) within `context_cache_window_max`.
-- **Per-app delta** \(\delta_{\text{app}}\): `context_cache_window_delta_by_app[application_id]` (defaults to `0` if missing).
-  - Integer turn offset (may be negative). The map starts empty. When present, it lets different applications
-    use different context window sizes while sharing the same base \(N\) and overall factor — expressed as an
-    absolute offset in turns rather than a relative scale.
-
-#### SLO-driven per-app deltas (server hook)
-
-When you register/deregister applications via `POST /v1/applications` / `DELETE /v1/applications/{id}`, the server
-calls `on_application_registry_changed()` (`gptcache_server/server.py`) which recomputes
-`context_cache_window_delta_by_app` from the registered **SLO targets**:
-
-- **Latency strictness**: lower `latency_p99_ms` ⇒ stricter (uses `1/latency_p99_ms`) ⇒ **negative** delta (shrink)
-- **Accuracy strictness**: higher `accuracy_slo` ⇒ stricter ⇒ **positive** delta (grow)
-
-Algorithm (low-latency, \(O(n)\) over registered apps):
-
-- Min-max normalize `1/latency_p99_ms` and `accuracy_slo` to \([0,1]\) (missing values contribute 0).
-- Directional score per app (\(\alpha=0.8\), \(\beta=0.2\) biases toward latency reduction):
-  - `score = beta * norm_accuracy - alpha * norm_latency`
-- Map score to an integer turn offset, scaled by available headroom:
-  - positive score → up to `(W_max - N)` extra turns
-  - negative score → down to `-(N - 1)` turns (clamped so effective window stays ≥ 1)
-  - a small negative baseline shift keeps the average window below \(N\) for mixed app sets.
-
-Server CLI flags (`gptcache_server/server.py`):
-
-- `-s, --host`
-- `-p, --port`
-- `-d, --cache-dir`
-- `-k, --cache-file-key`
-- `-f, --cache-config-file`
-- `-o, --openai`
-- `-of, --openai-cache-config-file`
-
----
-
-## Context input format
-
-This branch supports two styles at preprocessing time:
-
-- simple prompt (`prompt`)
-- chat message content
-
-For context-aware multi-turn matching, the preprocessors can return either:
-
-- a single value, or
-- a tuple `(current_query, context_history)`
-
-The adapter now handles both return shapes safely.
-
-### Important request-shape note for `/v1/chat/completions` on this branch
-
-Current `adapt()` logic expects `messages[-1]["content"]` to be list-like in some paths.
-If you pass a plain string, prompt handling can degrade (for example only the last character may be treated as the current question).
-
-Recommended payload for this branch:
-
-```json
-{
-  "messages": [
-    {
-      "role": "user",
-      "content": ["Your current question here"]
-    }
-  ]
-}
-```
-
-Example with context:
-
-```json
-{
-  "messages": [
-    {
-      "role": "user",
-      "content": [
-        "Previous user question: ...",
-        "Previous model response: ...",
-        "Current question: ..."
-      ]
-    }
-  ]
-}
-```
-
----
-
-## Observability and reporting
-
-`gptcache/report.py` tracks timing/counts for:
-
-- pre-process
-- embedding
-- search
-- data fetch
-- evaluation
-- post-process
-- llm
-- save
-- cache hit count (`hint_cache_count`)
-
-You can integrate custom logging with `Config(log_time_func=...)`.
-
----
-
-## Troubleshooting
-
-### Server starts but `/put` or `/get` fails
-
-- Ensure you are using this updated branch state.
-- Check server traceback output for adapter/runtime errors.
-- Verify writable cache directory path (`-d`).
-
-### OpenAI proxy returns 500
-
-- Confirm `OPENAI_API_KEY`/Authorization header is valid.
-- Verify network access from runtime environment.
-- Test with a minimal non-stream request first.
-
-### Response is irrelevant and cache hit is `true`
-
-Symptom example:
-
-- Response content does not match current prompt.
-- Return tuple includes hit flag `true`.
-- Response object shows `"gptcache": true`.
-
-Cause:
-
-- A prior malformed request shape can cache an irrelevant answer.
-- Later requests may semantically match that stale entry and return it as a cache hit.
-
-Immediate recovery options:
-
-1. Force miss for verification:
-
-```bash
-curl -s -X POST http://127.0.0.1:8012/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $OPENAI_API_KEY" \
-  -d '{
-    "model":"gpt-3.5-turbo",
-    "cache_skip": true,
-    "messages":[{"role":"user","content":["Say no in 2 words."]}],
-    "temperature":0
-  }'
-```
-
-2. Clear cache data directory and restart server:
-
-```bash
-rm -rf /tmp/contextcache_data
-mkdir -p /tmp/contextcache_data
-env -u APPIMAGE /usr/bin/python3 -m gptcache_server.server -s 127.0.0.1 -p 8012 -d /tmp/contextcache_data -o True
-```
-
-Note: `/flush` persists cache to storage; it does not delete entries.
-
+Excludes local secrets and generated config patterns (for example **`config/*.local.json`**).
+-->
