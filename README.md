@@ -131,7 +131,7 @@ This section describes the major functions of our source code and where they are
 
 - **`scripts/run_lm10_load_slo_adaptive_experiments.sh`** — Runs focused experiments combining load-adaptive and SLO-adaptive behavior.
 
-- **`scripts/repro_dry_window_activation.sh`** — Reproducibility script for a delayed-load dry-run experiment that highlights adaptive context-window transitions.
+- **`scripts/repro_dry_window_activation.sh`** — Runs a dry-run delayed-load experiment to demonstrate adaptive context-window transitions.
 
 ### 3. Plotting Scripts
 
